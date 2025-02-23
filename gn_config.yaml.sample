@@ -1,0 +1,6 @@
+# Configuration de la connexion
+clickhouse_host: '127.0.0.1'
+clickhouse_port: 9000
+app_port: 6000
+database_name: 'mytme'
+table_name: 'lesmsg'
