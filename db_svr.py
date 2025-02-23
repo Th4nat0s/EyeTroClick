@@ -126,7 +126,6 @@ def search():
         # Convertir en float
         timing = float(end_time - start_time)
         timing = f"{timing:.5f}"
-
         del client
         results = { 'has_more': has_more, 'results': results_dict , 'timing': timing} # _ , "lenght": len_result }
         return jsonify(results)
@@ -152,6 +151,7 @@ def get_msg():
         # Préparer les résultats
         column_names = valid_fields
         results_dict = [dict(zip(column_names, row)) for row in result]
+        del(client)
         return jsonify(results_dict)
     else:
         return jsonify({})
@@ -225,7 +225,7 @@ def get_stats_chan():
 
     # 1. Créer une liste des dernières 24 heures à partir de l'heure actuelle
     now = datetime.now().replace(minute=0, second=0, microsecond=0)  # Obtenir la date et heure actuelle
-    hours_list = [(now - timedelta(hours=i)) for i in range(24)]  # Créer une liste des dernières 24 heures
+    # hours_list = [(now - timedelta(hours=i)) for i in range(24)]  # Créer une liste des dernières 24 heures
     hours_format_display = [(now - timedelta(hours=i)).strftime("%H:00") for i in range(24)]  # Format "hh.00"
 
     # 2. Convertir les heures de daily_data en un dictionnaire pour accès rapide
@@ -336,7 +336,6 @@ def user_brief():
 
     # Connect to clickhouse 
     client = Client(host=clickhouse_host, port=clickhouse_port)
-
 
     user_id = request.args.get('user_id')
     s_max = 500
@@ -547,4 +546,3 @@ def insert_records():
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=app_port)
-
