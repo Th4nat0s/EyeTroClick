@@ -151,7 +151,6 @@ def get_msg():
         # Préparer les résultats
         column_names = valid_fields
         results_dict = [dict(zip(column_names, row)) for row in result]
-        del(client)
         return jsonify(results_dict)
     else:
         return jsonify({})
