@@ -562,7 +562,7 @@ def get_graph():
             WHERE chat_id = {chat_id}
             AND msg_fwd_id != 0 
             AND sender_chat_id != {chat_id}
-            limit 500
+            limit 100
         """
 
         # Exécution des requêtes
