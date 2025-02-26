@@ -543,6 +543,99 @@ def insert_records():
         del client
 
 
+@app.route('/graph', methods=['GET'])
+def get_graph():
+    chat_id = request.args.get('chat_id')
+
+    clickhouse_client = Client(host=clickhouse_host, port=clickhouse_port)
+    if not chat_id:
+        return jsonify({'error': 'chat_id is required'}), 400
+
+    try:
+        # Requête pour récupérer les nouds (utilisateurs du chat_id)
+        nodes_query = f"""
+            SELECT DISTINCT
+                sender_chat_id AS id,
+                username AS label,
+                chat_name
+            FROM tme_prod.msg
+            WHERE chat_id = {chat_id}
+            AND msg_fwd_id != 0 
+            AND sender_chat_id != {chat_id}
+            limit 500
+        """
+
+        # Exécution des requêtes
+        nodes_result = clickhouse_client.execute(nodes_query)
+        # edges_result = clickhouse_client.execute(edges_query)
+
+        # Dictionnaire pour assurer l'unicité des nœuds
+        nodes_map = {}
+
+        chat_name = ""
+        for row in nodes_result:
+            user_id = row[0]
+            username = row[1].replace("None", "")
+            chat_name = row[2]
+
+            if user_id not in nodes_map:
+                nodes_map[user_id] = {'id': user_id, 'labels': set()}
+            nodes_map[user_id]['labels'].add(username)  # Utilisation d'un set pour stocker les labels
+
+        # Liste des nœuds et des arêtes
+        nodes = [{'id': 1, 'label': f"{chat_id}\n{chat_name}", 'shape': "box", 'color':'purple'}]  # Ajouter le channel principal
+
+        edges = []
+        seen_edges = set()
+
+        for row in nodes_result:
+            from_id = 1  # Assumons que le noeud source est toujours 1
+            to_id = row[0]  # id du nœud cible
+            edge_label = ""  # Label pour l'arête
+
+            edge = (from_id, to_id)  # Crée un tuple représentant l'arête
+
+            # Vérifie si l'arête n'a pas encore été ajoutée
+            if edge not in seen_edges:
+                edges.append({'from': from_id, 'to': to_id, 'label': edge_label})
+                seen_edges.add(edge)  # Ajoute l'arête à l'ensemble pour éviter les doublons
+
+
+        # Ajouter les utilisateurs comme nœuds
+        for user_id, user_data in nodes_map.items():
+            nodes.append({'id': user_data['id'], 'label': f'{user_data["id"]}\n'+'\n'.join(user_data['labels'])})
+
+        # Vérifier si chaque utilisateur est aussi dans d'autres chats
+        for user_id in nodes_map.keys():
+            other_chats_query = f"""
+                SELECT DISTINCT chat_id, chat_name
+                FROM tme_prod.msg
+                WHERE sender_chat_id = {user_id}
+                AND chat_id != {chat_id} 
+            """
+            other_chats_result = clickhouse_client.execute(other_chats_query)
+
+            for other_chat in other_chats_result:
+                other_chat_id = other_chat[0]
+                other_chat_node_id = f'{other_chat_id}'  # ID unique pour éviter les conflits
+
+                # Ajouter le nouveau chat en rouge s'il n'existe pas déjà
+                if not any(n['id'] == other_chat_node_id for n in nodes):
+                    nodes.append({'id': other_chat_node_id, 'label': f'{other_chat_id}\n{other_chat[1]}', 'color': 'red', 'shape':'box'})
+
+                # Vérifie si user_id est différent de other_chat_node_id avant d'ajouter l'arête
+                if str(user_id) != other_chat_node_id:
+                    edges.append({'from': user_id, 'to': other_chat_node_id})
+
+
+        # Retourner les données au format JSON
+        return jsonify({'nodes': nodes, 'edges': edges})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        del clickhouse_client 
+
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=app_port)
