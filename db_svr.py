@@ -4,6 +4,7 @@
 from flask import Flask, request, jsonify, Response
 from clickhouse_driver import Client
 from datetime import datetime, timedelta, date
+from collections import defaultdict
 import time
 import os
 import yaml
@@ -574,7 +575,7 @@ def get_graph():
         chat_name = ""
         for row in nodes_result:
             user_id = row[0]
-            username = row[1].replace("None", "")
+            username = row[1].replace("None", "") # suite a une non gestion historique, certain champ usernane sont none
             chat_name = row[2]
 
             if user_id not in nodes_map:
@@ -634,6 +635,120 @@ def get_graph():
         return jsonify({'error': str(e)}), 500
     finally:
         del clickhouse_client 
+
+@app.route('/user_talk/<int:user>', methods=['GET'])
+def user_talk(user):
+    # Requête ClickHouse pour récupérer les données pour un user donné
+
+    client = Client(host=clickhouse_host, port=clickhouse_port)
+    query = f"""
+    SELECT
+        toDate(date) AS day,
+        chat_id,
+        chat_name,
+        COUNT(*) AS count
+    FROM tme_prod.msg
+    WHERE sender_chat_id = {user}
+    GROUP BY day, chat_id, chat_name
+    ORDER BY day
+    """
+    
+    # Exécuter la requête ClickHouse et obtenir le résultat
+    result = client.execute(query)
+    
+    # Organiser les données dans un dictionnaire pour le traitement
+    data = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+    
+    # Remplir le dictionnaire avec les données
+    for row in result:
+        day, chat_id, chat_name, count = row
+        data[day][chat_id]['name'] = chat_name
+        data[day][chat_id]['count'] += count  # Incrémenter le count pour chaque chat_id et jour
+    
+    # Transformer le dictionnaire en une liste de dictionnaires pour le format JSON
+    formatted_data = []
+    for day, chats in data.items():
+        for chat_id, chat_info in chats.items():
+            formatted_data.append({
+                'day': str(day),  # Convertir la date en chaîne pour le JSON
+                'chat_id': chat_id,
+                'chat_name': chat_info['name'],
+                'count': chat_info['count']
+            })
+    del(client) 
+    return jsonify(formatted_data)
+
+@app.route('/user_dailytalk/<int:user_id>')
+def user_dailytalk(user_id):
+    client = Client(host=clickhouse_host, port=clickhouse_port)
+    # Requête pour récupérer les données depuis ClickHouse
+    query = f"""
+        SELECT 
+            toStartOfHour(date) AS hour, 
+            toDayOfWeek(date) AS day_of_week,
+            count(*) AS count
+        FROM 
+            tme_prod.msg
+        WHERE 
+            sender_chat_id = {user_id}
+        GROUP BY 
+            hour, day_of_week
+        ORDER BY 
+            day_of_week, hour
+    """
+    query = f"""
+    SELECT
+        toHour(date) AS hour,                  -- Extraire l'heure
+        toDayOfWeek(date) AS day_of_week,      -- Extraire le jour de la semaine (1 = lundi, 2 = mardi, ...)
+        count(*) AS message_count              -- Compter le nombre de messages
+    FROM
+        tme_prod.msg  -- Nom de la table
+    WHERE
+        sender_chat_id = {user_id}             -- Filtrer pour l'utilisateur avec l'ID spécifique (sender_chat_id)
+    GROUP BY
+        day_of_week,                           -- Regrouper par jour de la semaine
+        hour                                   -- Regrouper par heure
+    ORDER BY
+        day_of_week ASC,                       -- Trier par jour de la semaine (lundi = 1, dimanche = 7)
+        hour ASC                               -- Trier par heure (0 à 23)
+    """
+
+
+    # Exécuter la requête
+    result = client.execute(query)
+    
+    # Créer des dictionnaires pour les données de la heatmap
+    heatmap_data = {
+        "Monday": [0] * 24,
+        "Tuesday": [0] * 24,
+        "Wednesday": [0] * 24,
+        "Thursday": [0] * 24,
+        "Friday": [0] * 24,
+        "Saturday": [0] * 24,
+        "Sunday": [0] * 24
+    }
+
+    # Mapper les numéros de jours de la semaine (1 = Monday, 7 = Sunday) aux noms de jours
+    jours_map = {
+        1: 'Monday', 2: 'Tuesday', 3: 'Wednesday', 
+        4: 'Thursday', 5: 'Friday', 6: 'Saturday', 7: 'Sunday'
+    }
+
+    # remplir les données de la heatmap
+    for row in result:
+        hour = row[0]  # Heure de la date (0-23)
+        day_of_week = jours_map[row[1]]  # Jour de la semaine
+        count = row[2]  # Nombre de messages
+
+        # Ajouter les messages dans le bon jour et heure
+        heatmap_data[day_of_week][hour] = count
+
+    del(client)
+    # Convertir le dictionnaire en JSON
+    return jsonify(heatmap_data)
+
+
+
 
 
 if __name__ == '__main__':
