@@ -11,7 +11,6 @@ import yaml
 import json
 import logging
 
-
 app = Flask(__name__)
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(THIS_DIR, "./gn_config.yaml")) as f:
@@ -747,8 +746,35 @@ def user_dailytalk(user_id):
     # Convertir le dictionnaire en JSON
     return jsonify(heatmap_data)
 
+@app.route('/user_details/<int:user_id>')
+def user_details(user_id):
+    client = Client(host=clickhouse_host, port=clickhouse_port)
+    # Requête pour récupérer les données depuis ClickHouse
+    if not valid_integer(user_id):
+        return jsonify({'results': False})
 
+    query = f" select date from  tme_prod.msg where sender_chat_id = {user_id} order by date asc limit 1;" 
+    data = client.execute(query)
+    date_in = data[0][0].strftime("%d/%m/%Y")
 
+    query = f" select date from  tme_prod.msg where sender_chat_id = {user_id} order by date desc limit 1;" 
+    data = client.execute(query)
+    date_out = data[0][0].strftime("%d/%m/%Y")
+
+    resume = f"Account {user_id} is active since {date_in} to {date_out}"
+
+    query = f"SELECT distinct(chat_id,chat_name, username ) FROM tme_prod.msg where sender_chat_id == {user_id}"
+
+    pseudos = []
+    data = client.execute(query)
+    for line in data:
+        username = line[0][2].replace("None", "") # suite a une non gestion historique, certain champ usernane sont none
+        if username == " ":
+            pseudos.append(("Unknown pseudo",line[0][0],line[0][1]))
+        else:
+            pseudos.append((username,line[0][0],line[0][1]))
+
+    return jsonify({'resume': resume, 'pseudos': pseudos, 'results': True})
 
 
 if __name__ == '__main__':
