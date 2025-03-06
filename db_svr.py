@@ -626,7 +626,6 @@ def get_graph():
                 if str(user_id) != other_chat_node_id:
                     edges.append({'from': user_id, 'to': other_chat_node_id})
 
-
         # Retourner les données au format JSON
         return jsonify({'nodes': nodes, 'edges': edges})
 
@@ -654,6 +653,8 @@ def user_talk(user):
     
     # Exécuter la requête ClickHouse et obtenir le résultat
     result = client.execute(query)
+    if not result:
+        return jsonify({})
     
     # Organiser les données dans un dictionnaire pour le traitement
     data = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
@@ -682,20 +683,6 @@ def user_dailytalk(user_id):
     client = Client(host=clickhouse_host, port=clickhouse_port)
     # Requête pour récupérer les données depuis ClickHouse
     query = f"""
-        SELECT 
-            toStartOfHour(date) AS hour, 
-            toDayOfWeek(date) AS day_of_week,
-            count(*) AS count
-        FROM 
-            tme_prod.msg
-        WHERE 
-            sender_chat_id = {user_id}
-        GROUP BY 
-            hour, day_of_week
-        ORDER BY 
-            day_of_week, hour
-    """
-    query = f"""
     SELECT
         toHour(date) AS hour,                  -- Extraire l'heure
         toDayOfWeek(date) AS day_of_week,      -- Extraire le jour de la semaine (1 = lundi, 2 = mardi, ...)
@@ -711,10 +698,10 @@ def user_dailytalk(user_id):
         day_of_week ASC,                       -- Trier par jour de la semaine (lundi = 1, dimanche = 7)
         hour ASC                               -- Trier par heure (0 à 23)
     """
-
-
     # Exécuter la requête
     result = client.execute(query)
+    if not result:  # Si pas de data, empty reponse.
+        return jsonify({})
     
     # Créer des dictionnaires pour les données de la heatmap
     heatmap_data = {
@@ -755,6 +742,8 @@ def user_details(user_id):
 
     query = f" select date from  tme_prod.msg where sender_chat_id = {user_id} order by date asc limit 1;" 
     data = client.execute(query)
+    if not data:
+        return jsonify({'results': False})
     date_in = data[0][0].strftime("%d/%m/%Y")
 
     query = f" select date from  tme_prod.msg where sender_chat_id = {user_id} order by date desc limit 1;" 
