@@ -85,23 +85,35 @@ def search():
 
     if not method:
         method = "is"
-
     numerical = False
+    arrayquery = False
     if field == "chat_id":
         svalue = "%(value)i"
         value = int(value)
         numerical = True
+    elif field == "urls" or field == "hashtags":
+        # urls is a query inside 
+        arrayquery = True
+        svalue = "%(value)s"
     else:
         svalue = "%(value)s"
 
-    # Construire la requête SQL
-    # POssibliité avec final avant le where pour eviter les doubles
-    if method.lower() == "like":
-        query = f"SELECT * FROM {database_name}.{table_name}  WHERE {field} LIKE {svalue} order by date desc limit {count}"
-    elif method.lower() == "ilike":
-        query = f"SELECT * FROM {database_name}.{table_name}   WHERE positionCaseInsensitiveUTF8({field}, {svalue}) >0  order by date desc limit {count}"
+    if arrayquery:
+        if method.lower() == "like":
+            query = f"SELECT * FROM {database_name}.{table_name} WHERE arrayExists(u -> u LIKE {svalue}, {field}) order by date desc limit {count}"
+        if method.lower() == "ilike":
+            query = f"SELECT * FROM {database_name}.{table_name} WHERE arrayExists(u -> positionCaseInsensitiveUTF8(u, {svalue}) > 0 , {field}) order by date desc limit {count}"
+        else:
+            query = f"SELECT * FROM {database_name}.{table_name} WHERE arrayExists(u -> u = {svalue}, {field}) order by date desc limit {count}"
     else:
-        query = f"SELECT * FROM {database_name}.{table_name}  WHERE {field} = {svalue} order by date desc limit {count}"
+        # Construire la requête SQL
+        # POssibliité avec final avant le where pour eviter les doubles
+        if method.lower() == "like":
+            query = f"SELECT * FROM {database_name}.{table_name}  WHERE {field} LIKE {svalue} order by date desc limit {count}"
+        elif method.lower() == "ilike":
+            query = f"SELECT * FROM {database_name}.{table_name}   WHERE positionCaseInsensitiveUTF8({field}, {svalue}) >0  order by date desc limit {count}"
+        else:
+            query = f"SELECT * FROM {database_name}.{table_name}  WHERE {field} = {svalue} order by date desc limit {count}"
     try:
         # Exécuter la requête
         if method.lower() == "like" and not numerical:
