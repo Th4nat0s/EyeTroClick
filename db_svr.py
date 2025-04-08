@@ -101,7 +101,7 @@ def search():
     if arrayquery:
         if method.lower() == "like":
             query = f"SELECT * FROM {database_name}.{table_name} WHERE arrayExists(u -> u LIKE {svalue}, {field}) order by date desc limit {count}"
-        if method.lower() == "ilike":
+        elif method.lower() == "ilike":
             query = f"SELECT * FROM {database_name}.{table_name} WHERE arrayExists(u -> positionCaseInsensitiveUTF8(u, {svalue}) > 0 , {field}) order by date desc limit {count}"
         else:
             query = f"SELECT * FROM {database_name}.{table_name} WHERE arrayExists(u -> u = {svalue}, {field}) order by date desc limit {count}"
@@ -117,6 +117,7 @@ def search():
     try:
         # Exécuter la requête
         if method.lower() == "like" and not numerical:
+
             result = client.execute(query, {'value': f'%{value}%'})
         elif not numerical:
             result = client.execute(query, {'value': f'{value}'})
@@ -142,7 +143,7 @@ def search():
         results = { 'has_more': has_more, 'results': results_dict , 'timing': timing} # _ , "lenght": len_result }
         return jsonify(results)
     except Exception as e:
-        print(f"error: {e}, \n {query}")
+        print(f"error: {e}, \n {query}")
         del client
         return jsonify({'error': str(e)}), 500
 
