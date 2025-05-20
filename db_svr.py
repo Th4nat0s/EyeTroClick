@@ -147,6 +147,30 @@ def search():
         del client
         return jsonify({'error': str(e)}), 500
 
+# Route pour avoir plein de messages
+@app.route('/get_bulk_msgs', methods=['POST'])
+def get_bulk_msg():
+    # Connect to clickhouse 
+    client = Client(host=clickhouse_host, port=clickhouse_port)
+
+    msgs = ", ".join(f"({chat_id},{msg_id})" for chat_id, msg_id in json.loads(request.get_json()))
+    
+    # For Test
+    # msgs = (1002226407578, 2619),(1001906370364, 124), (1002496052449, 33), (1002420966456, 80), (1002431844842, 521), (1002471872732, 105), (1002431844842, 495)
+    
+    column_names = ["chat_id", "msg_id", "chat_name", "title", "username", "document_name",  
+                    "document_size", "text"]
+    
+    query_column = ", ".join(column_names)
+    query = f"SELECT {query_column} FROM {database_name}.{table_name} WHERE (chat_id, msg_id) in ({msgs})"
+    result = client.execute(query, {})
+    del client
+    
+    results_dict = [dict(zip(column_names, row)) for row in result]
+    hash_return = {}
+    for item in (results_dict):
+        hash_return[f"{item.get('chat_id')}-{item.get('msg_id')}"] = item
+    return jsonify(hash_return)
 
 # Route pour avoir un message
 @app.route('/get_msg', methods=['GET'])
