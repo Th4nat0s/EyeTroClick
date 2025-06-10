@@ -10,6 +10,9 @@ import os
 import yaml
 import json
 import logging
+import hashlib
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 
 app = Flask(__name__)
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,6 +34,38 @@ valid_fields = ['id', 'chat_id', 'chat_name', 'username', 'sender_chat_id',
                 'document_type', 'document_size', 'msg_fwd', 'msg_fwd_username',
                 'msg_fwd_title', 'msg_fwd_id',
                 'text', 'lang', 'urls', 'hashtags']
+
+star = ''' msg_id,
+        chat_id,
+        chat_name,
+        username,
+        sender_chat_id,
+        title,
+        formatDateTime(toTimeZone(date, 'UTC'), '%%Y-%%m-%%dT%%H:%%i:%%S+00:00') AS date_utc,
+        formatDateTime(toTimeZone(insert_date, 'UTC'), '%%Y-%%m-%%dT%%H:%%i:%%S+00:00') AS insert_date_utc,
+        document_present,
+        document_name,
+        document_type,
+        document_size,
+        msg_fwd,
+        msg_fwd_username,
+        msg_fwd_title,
+        msg_fwd_id,
+        text,
+        lang,
+        urls,
+        hashtags'''
+
+def convert_dates_to_iso(data):
+    for item in data:
+        for field in ['date', 'insert_date']:
+            if field in item and isinstance(item[field], str):
+                try:
+                    dt = parsedate_to_datetime(item[field])
+                    item[field] = dt.astimezone(timezone.utc).isoformat(timespec='seconds')
+                except Exception as e:
+                    print(f"Erreur conversion {field} : {e}")
+    return data
 
 
 def convert_record(record):
@@ -98,22 +133,24 @@ def search():
     else:
         svalue = "%(value)s"
 
+
+
     if arrayquery:
         if method.lower() == "like":
-            query = f"SELECT * FROM {database_name}.{table_name} WHERE arrayExists(u -> u LIKE {svalue}, {field}) order by date desc limit {count}"
+            query = f"SELECT {star} FROM {database_name}.{table_name} WHERE arrayExists(u -> u LIKE {svalue}, {field}) order by date desc limit {count}"
         elif method.lower() == "ilike":
-            query = f"SELECT * FROM {database_name}.{table_name} WHERE arrayExists(u -> positionCaseInsensitiveUTF8(u, {svalue}) > 0 , {field}) order by date desc limit {count}"
+            query = f"SELECT {star} FROM {database_name}.{table_name} WHERE arrayExists(u -> positionCaseInsensitiveUTF8(u, {svalue}) > 0 , {field}) order by date desc limit {count} "
         else:
-            query = f"SELECT * FROM {database_name}.{table_name} WHERE arrayExists(u -> u = {svalue}, {field}) order by date desc limit {count}"
+            query = f"SELECT {star} FROM {database_name}.{table_name} WHERE arrayExists(u -> u = {svalue}, {field}) order by date desc limit {count}"
     else:
         # Construire la requête SQL
         # POssibliité avec final avant le where pour eviter les doubles
         if method.lower() == "like":
-            query = f"SELECT * FROM {database_name}.{table_name}  WHERE {field} LIKE {svalue} order by date desc limit {count}"
+            query = f"SELECT {star} FROM {database_name}.{table_name}  WHERE {field} LIKE {svalue} order by date desc limit {count}"
         elif method.lower() == "ilike":
-            query = f"SELECT * FROM {database_name}.{table_name}   WHERE positionCaseInsensitiveUTF8({field}, {svalue}) >0  order by date desc limit {count}"
+            query = f"SELECT {star} FROM {database_name}.{table_name}   WHERE positionCaseInsensitiveUTF8({field}, {svalue}) >0  order by date desc limit {count}"
         else:
-            query = f"SELECT * FROM {database_name}.{table_name}  WHERE {field} = {svalue} order by date desc limit {count}"
+            query = f"SELECT {star} FROM {database_name}.{table_name}  WHERE {field} = {svalue} order by date desc limit {count}"
     try:
         # Exécuter la requête
         if method.lower() == "like" and not numerical:
@@ -172,26 +209,38 @@ def get_bulk_msg():
         hash_return[f"{item.get('chat_id')}-{item.get('msg_id')}"] = item
     return jsonify(hash_return)
 
-# Route pour avoir un message
+
+# Route pour récupérer un message
 @app.route('/get_msg', methods=['GET'])
 def get_msg():
-    # Connect to clickhouse 
-    client = Client(host=clickhouse_host, port=clickhouse_port)
-
     msg_id = request.args.get('msg_id')
     chat_id = request.args.get('channel_id')
-    if valid_integer(msg_id) and valid_integer(chat_id):
-        query = f"SELECT * FROM {database_name}.{table_name} WHERE msg_id = {msg_id} and chat_id = {chat_id} LIMIT 1"
-        result = client.execute(query, {})
-        del client
 
-        # Préparer les résultats
-        column_names = valid_fields
-        results_dict = [dict(zip(column_names, row)) for row in result]
-        return jsonify(results_dict)
-    else:
+    if not (valid_integer(msg_id) and valid_integer(chat_id)):
         return jsonify({})
 
+    try:
+        client = Client(host=clickhouse_host, port=clickhouse_port)
+
+        query = f"""
+            SELECT {star} 
+            FROM {database_name}.{table_name}
+            WHERE msg_id = %(msg_id)s AND chat_id = %(chat_id)s
+            LIMIT 1
+        """
+        result = client.execute(query, {'msg_id': int(msg_id), 'chat_id': int(chat_id)})
+        column_names = valid_fields  # Make sure this matches the SELECT columns order
+        results_dict = [dict(zip(column_names, row)) for row in result]
+
+        return jsonify(results_dict)
+
+    except Exception as e:
+        print(f"[ERROR] get_msg failed: {e}")
+        return jsonify({'error': 'internal server error'}), 500
+
+    finally:
+        if client:
+            client.disconnect()
 
 # Routes pour les stats
 @app.route('/get_stats_chan', methods=['GET'])
@@ -292,11 +341,8 @@ def get_stats_chan():
     result = client.execute(query, {})
     fresult['monthly'] = result
 
-
     del client
     return jsonify(fresult)
-
-
 
 # Routes pour les stats
 @app.route('/get_stats', methods=['GET'])
@@ -304,7 +350,6 @@ def get_stats():
 
     # Connect to clickhouse 
     client = Client(host=clickhouse_host, port=clickhouse_port)
-
 
     fresult={}
 
@@ -358,7 +403,7 @@ def get_stats():
     fresult['top50'] = result
 
     # Get stats about the db and compressions
-    query =f"SELECT name,  formatReadableSize(sum(data_compressed_bytes)) AS compressed_size,    formatReadableSize(sum(data_uncompressed_bytes)) AS uncompressed_size,    round(sum(data_uncompressed_bytes) / sum(data_compressed_bytes), 2) AS ratio FROM system.columns WHERE table = 'msg' GROUP BY name"
+    query ="SELECT name,  formatReadableSize(sum(data_compressed_bytes)) AS compressed_size,    formatReadableSize(sum(data_uncompressed_bytes)) AS uncompressed_size,    round(sum(data_uncompressed_bytes) / sum(data_compressed_bytes), 2) AS ratio FROM system.columns WHERE table = 'msg' GROUP BY name"
     result = client.execute(query, {})
     fresult['stats'] = result
 
@@ -387,7 +432,7 @@ def user_brief():
             json_result["last_msg"] = client.execute(query, {})[0][0]
             query = f"SELECT date FROM {database_name}.{table_name}  WHERE sender_chat_id == {user_id} order by date asc limit 1"
             json_result["first_msg"] = client.execute(query, {})[0][0]
-            query = f"SELECT * FROM {database_name}.{table_name}  WHERE sender_chat_id == {user_id} order by date desc limit {s_max+1}"
+            query = f"SELECT {star} FROM {database_name}.{table_name}  WHERE sender_chat_id == {user_id} order by date desc limit {s_max+1}"
             result = client.execute(query, {})
             has_more=False
             if len(result) >= s_max+1:
@@ -411,20 +456,22 @@ def stats_msg():
     # Connect to clickhouse 
     client = Client(host=clickhouse_host, port=clickhouse_port)
 
-    query = f"select count(msg_id), chat_id ,chat_name from tme_prod.msg  where date > toDateTime('2024-09-04 00:00:00') and date < toDateTime('2024-09-04 23:59:59')  group by chat_id,chat_name order by count(msg_id) desc limit 25"
+    query = "select count(msg_id), chat_id ,chat_name from tme_prod.msg  where date > toDateTime('2024-09-04 00:00:00') and date < toDateTime('2024-09-04 23:59:59')  group by chat_id,chat_name order by count(msg_id) desc limit 25"
     result = client.execute(query, {})
 
     del client
     return jsonify(result)
 
-# Route pour les last messages
 @app.route('/index', methods=['GET'])
 def index():
+    '''
+    Provides last 500 messages collected 
+    With "final" statement  
+    '''
     # Connect to clickhouse 
     client = Client(host=clickhouse_host, port=clickhouse_port)
-
-    query = f"select date, chat_id, msg_id, chat_name from {database_name}.{table_name} final where date > now() - INTERVAL 1 HOUR order by date desc"
-    # order by date desc limit 500"
+    # query = f"select date, chat_id, msg_id, chat_name from {database_name}.{table_name} final where date > now() - INTERVAL 1 HOUR order by date desc"
+    query = f"select formatDateTime(toTimeZone(date, 'UTC'), '%%Y-%%m-%%dT%%H:%%i:%%S+00:00') AS date, chat_id, msg_id, chat_name from {database_name}.{table_name} order by insert_date desc, msg_id desc limit 500"
     result = client.execute(query, {})
 
     del client
@@ -443,18 +490,21 @@ def count():
     del client
     return jsonify({"count": result[0][0]})
 
-# Route pour les last messages, 
-# donne les messages collectés dans la clickhouse
-# 2 param, 
-#   since = timestamp du debut.
-#   for = nombre de minutes a fournir.
+
 @app.route('/last', methods=['GET'])
 def last():
-    # Connect to clickhouse 
-    client = Client(host=clickhouse_host, port=clickhouse_port)
-
-
-    #  wget "http://localhost:6000/last?since=1724681600&for=15" -O -  | jq .
+    '''
+    # Route qui donne les last messages importés, 
+    # Filter out ce qui est "vide" (pas attachement, et pas text)
+    # Filter out ce qui est + de 2 ans.
+    # donne les messages collectés dans la clickhouse
+    # 2 params, 
+    #   since = timestamp du debut.
+    #   for = nombre de minutes a fournir.
+    #
+    #  wget "http://localhost:6000/last?since=1749342874&for=15" -O -  | jq .
+    '''
+    
     if request.args.get('since'):
         since = request.args.get('since') # Get Unix TimeStamp
     else:
@@ -476,25 +526,27 @@ def last():
         tfor = int(tfor)
     tfor = ( tfor * 60 ) + since # convert to millisec
 
-    # on demande que la date du post.. pas l'insert date, pbm de charge
-    query = f"select * from {database_name}.{table_name} where insert_date>=toDateTime({since}) and insert_date<=toDateTime({tfor}) AND ((document_present = 1) OR (text != '')) limit 2000000"
-
-    page_size = 50000  # Taille des records (chunk)
-    del client
-
+    page_size = 50000  # Taille des records par réponse (chunk)
     def generate():
-    
+        '''
+        Generator of message with pagination for query 
+        '''
         client = Client(host=clickhouse_host, port=clickhouse_port)
 
         messages = 0
         offset = 0
+
+        # on ne demande que la date spécifé dans le post 
+        # on ne prends pas les message de plus de 2 ans
+        # on ne prends pas les vide
         while True:
             # Requête SQL avec pagination et limite qui ne choppe pas les texte vide
             query = f"""
-            SELECT * 
+            SELECT {star} 
             FROM {database_name}.{table_name} 
             WHERE insert_date >= toDateTime({since}) 
               AND insert_date <= toDateTime({tfor}) 
+              AND date >= dateSub(now(), INTERVAL 2 YEAR) 
               AND ((document_present = 1) OR (text != '')) 
             LIMIT {page_size} OFFSET {offset}
             """
@@ -515,14 +567,14 @@ def last():
             for msg in results_dict:
                 messages += 1
                 # Convertir les objets datetime en compatible json
-                msg['insert_date'] = serialize_datetime(msg.get('insert_date'))
-                msg['date'] = serialize_datetime(msg.get('date'))
+                msg['insert_date'] = msg.get('insert_date')
+                msg['date'] = msg.get('date')
 
                 htext = f"On {msg.get('date')} on Telegram\n"
-                htext += f"The following data were collected in the channel {msg.get('chat_name')}/{msg.get('chat_id')} with message id {msg.get('id')}\n"
-                htext += f"User Username {msg.get('username')} / {msg.get('sender_chat_id')}\n"
+                htext += f"The following data was collected from the channel {msg.get('chat_name')}/{msg.get('chat_id')} with message id {msg.get('id')}\n"
+                htext += f"User {msg.get('username')}/{msg.get('sender_chat_id')} wrote\n"
                 htext += f"Subject: {msg.get('title')}\n"
-                htext += msg.get('text') + "\n"
+                htext += "Content: " + msg.get('text') + "\n"
                 if msg.get('msg_fwd') == 1:
                     htext += f"It was a forward from the channel {msg.get('msg_fwd_username')}/{msg.get('msg_fwd_id')}\n"
                 if msg.get('document_present') == 1:
@@ -532,6 +584,7 @@ def last():
                 out_dict.append({
                     "date": msg.get('insert_date'),
                     'text': htext,
+                    'text_hash': hashlib.md5(msg.get('text').encode('utf-8', 'ignore')).hexdigest() ,
                     'channel_id': msg.get('chat_id'),
                     'channel_name': msg.get('chat_name'),
                     'msg_id': msg.get('id')
@@ -548,12 +601,13 @@ def last():
     return Response(generate(), content_type='application/json')
 
 
-
-# Collect messages to integrate into the database.
 @app.route('/insert_records', methods=['POST'])
 def insert_records():
-    data = request.get_json()
+    '''
+    # Collect messages to integrate into the database.
+    '''
 
+    data = request.get_json()
     if not data:
         return jsonify({"error": "Invalid or missing JSON data"}), 400
 
