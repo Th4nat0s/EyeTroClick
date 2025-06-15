@@ -67,11 +67,20 @@ def convert_dates_to_iso(data):
                     print(f"Erreur conversion {field} : {e}")
     return data
 
+def parse_iso8601_flexible(date_str):
+    if len(date_str) >= 5 and (date_str[-5] in ['+', '-']) and date_str[-2:].isdigit():
+        # Extrait le décalage horaire
+        offset = date_str[-5:]
+        # Transforme 'HHMM' en 'HH:MM'
+        offset_fixed = offset[:3] + ':' + offset[3:]
+        # Remplace dans la date
+        date_str = date_str[:-5] + offset_fixed
+    return datetime.fromisoformat(date_str)
 
 def convert_record(record):
     """Convertit les champs date et datetime pour chaque record, merci Json"""
-    record[6] = datetime.fromisoformat(record[6])  # Conversion de 'date' (7e champ) au format datetime
-    record[7] = datetime.fromisoformat(record[7])  # Conversion de 'insert_date' (8e champ) au format datetime
+    record[6] = parse_iso8601_flexible(record[6])  # Conversion de 'date' (7e champ) au format datetime
+    record[7] = parse_iso8601_flexible(record[7])  # Conversion de 'insert_date' (8e champ) au format datetime
     return record
 
 
