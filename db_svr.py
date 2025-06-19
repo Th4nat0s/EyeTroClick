@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 # coding=utf-8
 
-from flask import Flask, request, jsonify, Response
-from clickhouse_driver import Client
-from datetime import datetime, timedelta, date
-from collections import defaultdict
+'''
+    This is the backend DB to EyeTroduit API Interface.
+
+    All of the Call are initiated from the CC
+    Authentication should be performed at IP level
+
+'''
+
 import time
 import os
-import yaml
-import json
 import logging
 import hashlib
-from datetime import timezone
+import json
+from datetime import datetime, timedelta, date, timezone
+from collections import defaultdict
 from email.utils import parsedate_to_datetime
+import yaml
+from flask import Flask, request, jsonify, Response
+from clickhouse_driver import Client
+
 
 app = Flask(__name__)
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -29,13 +37,13 @@ table_name = gn_config.get('table_name')
 logger = logging.getLogger(__name__)
 
 # Liste des colonnes valides pour éviter les injections SQL
-valid_fields = ['id', 'chat_id', 'chat_name', 'username', 'sender_chat_id',
+VALID_FIELDS = ['id', 'chat_id', 'chat_name', 'username', 'sender_chat_id',
                 'title', 'date', 'insert_date', 'document_present', 'document_name',
                 'document_type', 'document_size', 'msg_fwd', 'msg_fwd_username',
                 'msg_fwd_title', 'msg_fwd_id',
                 'text', 'lang', 'urls', 'hashtags']
 
-star = ''' msg_id,
+STAR = ''' msg_id,
         chat_id,
         chat_name,
         username,
@@ -57,6 +65,9 @@ star = ''' msg_id,
         hashtags'''
 
 def convert_dates_to_iso(data):
+    '''
+        This function, will convert datetime to utc in isoformat for key date and insest_date in a dict
+    '''
     for item in data:
         for field in ['date', 'insert_date']:
             if field in item and isinstance(item[field], str):
@@ -68,6 +79,9 @@ def convert_dates_to_iso(data):
     return data
 
 def parse_iso8601_flexible(date_str):
+    '''
+        This function, convert a date time isoformat string into python datetime object 
+    '''
     if len(date_str) >= 5 and (date_str[-5] in ['+', '-']) and date_str[-2:].isdigit():
         # Extrait le décalage horaire
         offset = date_str[-5:]
@@ -92,6 +106,9 @@ def serialize_datetime(obj):
 
 
 def valid_integer(value):
+    '''
+    This function check if the integer given in a string is really an integer
+    '''
     try:
         int(value)
         return True
@@ -102,20 +119,25 @@ def valid_integer(value):
 # Route pour les requêtes de recherche
 @app.route('/search', methods=['GET'])
 def search():
+    '''
+    This function is called by the search page on the CC
+    /telegramsearch/search_telegrams/
+    and allows searching into the database 
+    '''
 
     start_time = time.time()
-    # Connect to clickhouse 
+    # Connect to clickhouse
     client = Client(host=clickhouse_host, port=clickhouse_port)
 
     field = request.args.get('field')
     value = request.args.get('value')
     method = request.args.get('method')  # IS or LIKE
-    count = request.args.get('count') # Max responses...
+    local_count = request.args.get('count') # Max responses...
 
     # Si count non existant ou non valide, count = 100
     try:
-        count = int(count) if count else 1001
-        if count > 1001:
+        local_count = int(local_count) if local_count else 1001
+        if local_count > 1001:
             return jsonify({'error': 'Count exceeds limits'}), 400
     except ValueError:
         return jsonify({'error': 'Invalid Count'}), 400
@@ -124,7 +146,7 @@ def search():
     if not field or not value:
         return jsonify({'error': 'Missing field or value parameter'}), 400
 
-    if field not in valid_fields:
+    if field not in VALID_FIELDS:
         return jsonify({'error': 'Invalid field parameter'}), 400
 
     if not method:
@@ -136,7 +158,7 @@ def search():
         value = int(value)
         numerical = True
     elif field == "urls" or field == "hashtags":
-        # urls is a query inside 
+        # urls is a query inside
         arrayquery = True
         svalue = "%(value)s"
     else:
@@ -146,20 +168,35 @@ def search():
 
     if arrayquery:
         if method.lower() == "like":
-            query = f"SELECT {star} FROM {database_name}.{table_name} WHERE arrayExists(u -> u LIKE {svalue}, {field}) order by date desc limit {count}"
+            query = f"""SELECT {STAR}
+                        FROM {database_name}.{table_name} 
+                        WHERE arrayExists(u -> u LIKE {svalue}, {field}) 
+                        order by date desc limit {local_count}"""
         elif method.lower() == "ilike":
-            query = f"SELECT {star} FROM {database_name}.{table_name} WHERE arrayExists(u -> positionCaseInsensitiveUTF8(u, {svalue}) > 0 , {field}) order by date desc limit {count} "
+            query = f"""SELECT {STAR}
+                        FROM {database_name}.{table_name} 
+                        WHERE arrayExists(u -> positionCaseInsensitiveUTF8(u, {svalue}) > 0 , {field}) 
+                        order by date desc limit {local_count} """
         else:
-            query = f"SELECT {star} FROM {database_name}.{table_name} WHERE arrayExists(u -> u = {svalue}, {field}) order by date desc limit {count}"
+            query = f"""SELECT {STAR} FROM {database_name}.{table_name}
+                        WHERE arrayExists(u -> u = {svalue}, {field}) 
+                        order by date desc limit {local_count}"""
     else:
         # Construire la requête SQL
         # POssibliité avec final avant le where pour eviter les doubles
         if method.lower() == "like":
-            query = f"SELECT {star} FROM {database_name}.{table_name}  WHERE {field} LIKE {svalue} order by date desc limit {count}"
+            query = f"""SELECT {STAR}
+                      FROM {database_name}.{table_name}  
+                      WHERE {field} LIKE {svalue} 
+                      order by date desc limit {local_count}"""
         elif method.lower() == "ilike":
-            query = f"SELECT {star} FROM {database_name}.{table_name}   WHERE positionCaseInsensitiveUTF8({field}, {svalue}) >0  order by date desc limit {count}"
+            query = f"""SELECT {STAR}
+                        FROM {database_name}.{table_name}   
+                        WHERE positionCaseInsensitiveUTF8({field}, {svalue}) >0  
+                        order by date desc limit {local_count}"""
         else:
-            query = f"SELECT {star} FROM {database_name}.{table_name}  WHERE {field} = {svalue} order by date desc limit {count}"
+            query = f"""SELECT {STAR} FROM {database_name}.{table_name}
+                         WHERE {field} = {svalue} order by date desc limit {local_count}"""
     try:
         # Exécuter la requête
         if method.lower() == "like" and not numerical:
@@ -170,11 +207,11 @@ def search():
         else:
             result = client.execute(query, {'value': value})
         # Préparer les résultats
-        column_names = valid_fields
+        column_names = VALID_FIELDS
         results_dict = [dict(zip(column_names, row)) for row in result]
         len_result = len(result)
 
-        if len_result >= count:
+        if len_result >= local_count:
             has_more = "True"
             results_dict = results_dict[:-1]  # A faire avec offset un jour
         else:
@@ -196,22 +233,27 @@ def search():
 # Route pour avoir plein de messages
 @app.route('/get_bulk_msgs', methods=['POST'])
 def get_bulk_msg():
-    # Connect to clickhouse 
+    '''
+        this function  will get as input a tuples of chanid/msgid
+        and will get back a json array with message details.
+    '''
+
+    # Connect to clickhouse
     client = Client(host=clickhouse_host, port=clickhouse_port)
 
     msgs = ", ".join(f"({chat_id},{msg_id})" for chat_id, msg_id in json.loads(request.get_json()))
-    
+
     # For Test
-    # msgs = (1002226407578, 2619),(1001906370364, 124), (1002496052449, 33), (1002420966456, 80), (1002431844842, 521), (1002471872732, 105), (1002431844842, 495)
-    
-    column_names = ["chat_id", "msg_id", "chat_name", "title", "username", "document_name",  
+    # msgs = (1002226407578, 2619),(1001906370364, 124), (1002496052449, 33), (1002420966456, 80), etc…
+
+    column_names = ["chat_id", "msg_id", "chat_name", "title", "username", "document_name",
                     "document_size", "text"]
-    
+
     query_column = ", ".join(column_names)
     query = f"SELECT {query_column} FROM {database_name}.{table_name} WHERE (chat_id, msg_id) in ({msgs})"
     result = client.execute(query, {})
     del client
-    
+
     results_dict = [dict(zip(column_names, row)) for row in result]
     hash_return = {}
     for item in (results_dict):
@@ -222,6 +264,12 @@ def get_bulk_msg():
 # Route pour récupérer un message
 @app.route('/get_msg', methods=['GET'])
 def get_msg():
+    '''
+        Retrieve a Single message from database
+        need
+        * msg_id (int) Message ID
+        * channel_id (int) channel ID
+    '''
     msg_id = request.args.get('msg_id')
     chat_id = request.args.get('channel_id')
 
@@ -232,13 +280,13 @@ def get_msg():
         client = Client(host=clickhouse_host, port=clickhouse_port)
 
         query = f"""
-            SELECT {star} 
+            SELECT {STAR} 
             FROM {database_name}.{table_name}
             WHERE msg_id = %(msg_id)s AND chat_id = %(chat_id)s
             LIMIT 1
         """
         result = client.execute(query, {'msg_id': int(msg_id), 'chat_id': int(chat_id)})
-        column_names = valid_fields  # Make sure this matches the SELECT columns order
+        column_names = VALID_FIELDS  # Make sure this matches the SELECT columns order
         results_dict = [dict(zip(column_names, row)) for row in result]
 
         return jsonify(results_dict)
@@ -254,7 +302,15 @@ def get_msg():
 # Routes pour les stats
 @app.route('/get_stats_chan', methods=['GET'])
 def get_stats_chan():
-    # Connect to clickhouse 
+    '''
+        Get statistiscs for a single channel.
+
+        Param:
+        * chant_name
+    '''
+
+
+    # Connect to clickhouse
     client = Client(host=clickhouse_host, port=clickhouse_port)
 
     chat_name = request.args.get('chan_name')
@@ -288,7 +344,7 @@ def get_stats_chan():
     today = date.today()  # Obtenir la date actuelle
     date_list = [(today - timedelta(days=i)).strftime("%d/%m") for i in range(31)]
 
-    # Convertir les dates de daily_data en un dictionnaire 
+    # Convertir les dates de daily_data en un dictionnaire
     data_dict = {entry[0]: entry for entry in result}
 
     # Créer le tableau complet avec les 31 jours, remplis de 0 si data absente
@@ -309,11 +365,15 @@ def get_stats_chan():
 
 
     # Get the count of inserted document by last 24h
-    query = f"SELECT toStartOfHour(date) as actual_hour, formatDateTime(toStartOfHour(date), '%%H:00') as hour_formatted, count(*) as count from\
-             {database_name}.{table_name}  WHERE date >= subtractHours(now(), 24) and chat_id = {chat_id} GROUP BY actual_hour ORDER BY actual_hour DESC;"
-    query = f"SELECT formatDateTime(toStartOfHour(date), '%%H:00') as hour_formatted, count(*) as count FROM\
-             {database_name}.{table_name} WHERE date >= subtractHours(now(), 24) AND chat_id = {chat_id} GROUP BY toStartOfHour(date)\
-             ORDER BY toStartOfHour(date) DESC;"
+    query = f"""SELECT toStartOfHour(date) as actual_hour,
+                formatDateTime(toStartOfHour(date), '%%H:00') as hour_formatted,
+                count(*) as count 
+                from {database_name}.{table_name}  WHERE date >= subtractHours(now(), 24) and chat_id = {chat_id} 
+                GROUP BY actual_hour ORDER BY actual_hour DESC;"""
+    query = f"""SELECT formatDateTime(toStartOfHour(date), '%%H:00') as hour_formatted, count(*) as count
+                FROM {database_name}.{table_name} WHERE date >= subtractHours(now(), 24) AND chat_id = {chat_id} 
+                GROUP BY toStartOfHour(date)
+                ORDER BY toStartOfHour(date) DESC;"""
 
     result = client.execute(query, {})
 
@@ -344,9 +404,10 @@ def get_stats_chan():
     fresult['hourly'] = filled_data
 
     # Get the count of inserted document by all months
-    query = f"SELECT toStartOfMonth(date) as month, formatDateTime(toStartOfMonth(date), '%%Y/%%m') as month_formatted, count(*) as count FROM \
-              {database_name}.{table_name} WHERE date >= subtractMonths(now(), 24) and chat_id = {chat_id} \
-              GROUP BY month ORDER BY month DESC"
+    query = f"""SELECT toStartOfMonth(date) as month,
+                formatDateTime(toStartOfMonth(date), '%%Y/%%m') as month_formatted, count(*) as count 
+                FROM {database_name}.{table_name} WHERE date >= subtractMonths(now(), 24) and chat_id = {chat_id}
+                GROUP BY month ORDER BY month DESC"""
     result = client.execute(query, {})
     fresult['monthly'] = result
 
@@ -356,43 +417,67 @@ def get_stats_chan():
 # Routes pour les stats
 @app.route('/get_stats', methods=['GET'])
 def get_stats():
-
-    # Connect to clickhouse 
+    '''
+        Retrieve all stats for TGStatsView
+    '''
+    # Connect to clickhouse
     client = Client(host=clickhouse_host, port=clickhouse_port)
 
     fresult={}
 
     # Get the count of inserted document by last 31 jours
-    query = f"SELECT toDate(insert_date) as actual_date, formatDateTime(toDate(insert_date), '%%d/%%m') as day_formatted, count(*) as count FROM \
-              {database_name}.{table_name} WHERE insert_date >= toStartOfDay(subtractDays(now(), 31)) GROUP BY actual_date  ORDER BY actual_date DESC;"
+    query = f"""SELECT toDate(insert_date) as actual_date,
+                formatDateTime(toDate(insert_date), '%%d/%%m') as day_formatted, count(*) as count
+                FROM {database_name}.{table_name} WHERE insert_date >= toStartOfDay(subtractDays(now(), 31))
+                GROUP BY actual_date  ORDER BY actual_date DESC;"""
     result = client.execute(query, {})
     fresult['cdaily'] = result
 
     # Get the count of inserted document by last 24h
-    query = f"SELECT toStartOfHour(insert_date) as actual_hour, formatDateTime(toStartOfHour(insert_date), '%%H:00') as hour_formatted, count(*) as count FROM {database_name}.{table_name}  WHERE insert_date >= subtractHours(now(), 24) GROUP BY actual_hour ORDER BY actual_hour DESC;"
+    query = f"""SELECT toStartOfHour(insert_date) as actual_hour,
+                formatDateTime(toStartOfHour(insert_date), '%%H:00') as hour_formatted, 
+                count(*) as count FROM {database_name}.{table_name}  
+                WHERE insert_date >= subtractHours(now(), 24) GROUP BY actual_hour ORDER BY actual_hour DESC;"""
     result = client.execute(query, {})
     fresult['chourly'] = result
 
     # Get the count of inserted document by 24 months
-    query = f"SELECT toStartOfMonth(insert_date) as month,     formatDateTime(toStartOfMonth(insert_date), '%%Y/%%m') as month_formatted, count(*) as count FROM {database_name}.{table_name} WHERE insert_date >= subtractMonths(now(), 24) GROUP BY month ORDER BY month DESC limit 24"
+    query = f"""SELECT toStartOfMonth(insert_date) as month,
+                formatDateTime(toStartOfMonth(insert_date), '%%Y/%%m') as month_formatted, 
+                count(*) as count FROM {database_name}.{table_name} 
+                WHERE insert_date >= subtractMonths(now(), 24) 
+                GROUP BY month ORDER BY month DESC limit 24"""
     result = client.execute(query, {})
     fresult['cmonthly'] = result
 
 
     # Get the count of document in db by publish day on last 31 days
-    query = f"SELECT toStartOfMonth(insert_date) as month, formatDateTime(toDate(insert_date), '%%y/%%m'), count(*) as count FROM {database_name}.{table_name} WHERE insert_date >= subtractMonths(now(), 24) GROUP BY month ORDER BY month ASC"
-    query = f"SELECT toDate(date) as actual_date, formatDateTime(toDate(date), '%%d/%%m') as day_formatted, count(*) as count FROM \
-            {database_name}.{table_name} WHERE date >= toStartOfDay(subtractDays(now(), 31)) GROUP BY actual_date  ORDER BY actual_date DESC;"
+    query = f"""SELECT toStartOfMonth(insert_date) as month, formatDateTime(toDate(insert_date), '%%y/%%m'),
+                count(*) as count 
+                FROM {database_name}.{table_name} 
+                WHERE insert_date >= subtractMonths(now(), 24) 
+                GROUP BY month ORDER BY month ASC"""
+    query = f"""SELECT toDate(date) as actual_date, formatDateTime(toDate(date), '%%d/%%m') as day_formatted,
+                count(*) as count 
+                FROM {database_name}.{table_name} 
+                WHERE date >= toStartOfDay(subtractDays(now(), 31)) 
+                GROUP BY actual_date  ORDER BY actual_date DESC;"""
     result = client.execute(query, {})
     fresult['daily'] = result
 
     # Get the count of document in db by publish day on last 24h
-    query = f"SELECT toStartOfHour(date) as actual_hour, formatDateTime(toStartOfHour(date), '%%H:00') as hour_formatted, count(*) as count FROM {database_name}.{table_name}  WHERE date >= subtractHours(now(), 24) GROUP BY actual_hour ORDER BY actual_hour DESC;"
+    query = f"""SELECT toStartOfHour(date) as actual_hour,
+              formatDateTime(toStartOfHour(date), '%%H:00') as hour_formatted, 
+              count(*) as count FROM {database_name}.{table_name}
+              WHERE date >= subtractHours(now(), 24) 
+              GROUP BY actual_hour ORDER BY actual_hour DESC;"""
     result = client.execute(query, {})
     fresult['hourly'] = result
 
     # Get the count of document in db by publish day on last 24 month
-    query = f"SELECT toStartOfMonth(date) as month, formatDateTime(toStartOfMonth(date), '%%Y/%%m') as month_formatted, count(*) as count FROM {database_name}.{table_name} WHERE insert_date >= subtractMonths(now(), 24) GROUP BY month ORDER BY month DESC limit 24"
+    query = f"""SELECT toStartOfMonth(date) as month, formatDateTime(toStartOfMonth(date),
+              '%%Y/%%m') as month_formatted, count(*) as count FROM {database_name}.{table_name} 
+              WHERE insert_date >= subtractMonths(now(), 24) GROUP BY month ORDER BY month DESC limit 24"""
     result = client.execute(query, {})
     fresult['monthly'] = result
 
@@ -407,12 +492,16 @@ def get_stats():
     fresult['msgs'] = result[0]
 
     # get the top 50 chatty chans
-    query =f"SELECT      chat_id, chat_name, COUNT(msg_id) AS msg_count FROM {database_name}.{table_name} GROUP BY chat_id, chat_name ORDER BY msg_count DESC LIMIT 50; "
+    query =f"""SELECT chat_id, chat_name, COUNT(msg_id) AS msg_count FROM {database_name}.{table_name}
+             GROUP BY chat_id, chat_name ORDER BY msg_count DESC LIMIT 50; """
     result = client.execute(query, {})
     fresult['top50'] = result
 
     # Get stats about the db and compressions
-    query ="SELECT name,  formatReadableSize(sum(data_compressed_bytes)) AS compressed_size,    formatReadableSize(sum(data_uncompressed_bytes)) AS uncompressed_size,    round(sum(data_uncompressed_bytes) / sum(data_compressed_bytes), 2) AS ratio FROM system.columns WHERE table = 'msg' GROUP BY name"
+    query ="""SELECT name,  formatReadableSize(sum(data_compressed_bytes)) AS compressed_size,
+               formatReadableSize(sum(data_uncompressed_bytes)) AS uncompressed_size,    
+               round(sum(data_uncompressed_bytes) / sum(data_compressed_bytes), 2) 
+               AS ratio FROM system.columns WHERE table = 'msg' GROUP BY name"""
     result = client.execute(query, {})
     fresult['stats'] = result
 
@@ -423,8 +512,11 @@ def get_stats():
 # Route pour avoir un message
 @app.route('/user_brief', methods=['GET'])
 def user_brief():
+    '''
+        This function give information about a User id
+    '''
 
-    # Connect to clickhouse 
+    # Connect to clickhouse
     client = Client(host=clickhouse_host, port=clickhouse_port)
 
     user_id = request.args.get('user_id')
@@ -434,14 +526,18 @@ def user_brief():
     if valid_integer(user_id):
         query = f"SELECT count(*) FROM {database_name}.{table_name} WHERE sender_chat_id = {user_id}"
         json_result["msg_count"] = client.execute(query, {})[0][0]
-        if json_result["msg_count"] > 0: 
-            query = f"SELECT chat_id, chat_name FROM {database_name}.{table_name} WHERE sender_chat_id = {user_id} group by chat_id, chat_name"
+        if json_result["msg_count"] > 0:
+            query = f"""SELECT chat_id, chat_name FROM {database_name}.{table_name}
+                        WHERE sender_chat_id = {user_id} group by chat_id, chat_name"""
             json_result["user_chats"] = client.execute(query, {})
-            query = f"SELECT date FROM {database_name}.{table_name} WHERE sender_chat_id == {user_id} order by date desc limit 1"
+            query = f"""SELECT date FROM {database_name}.{table_name}
+                        WHERE sender_chat_id == {user_id} order by date desc limit 1"""
             json_result["last_msg"] = client.execute(query, {})[0][0]
-            query = f"SELECT date FROM {database_name}.{table_name}  WHERE sender_chat_id == {user_id} order by date asc limit 1"
+            query = f"""SELECT date FROM {database_name}.{table_name}
+                        WHERE sender_chat_id == {user_id} order by date asc limit 1"""
             json_result["first_msg"] = client.execute(query, {})[0][0]
-            query = f"SELECT {star} FROM {database_name}.{table_name}  WHERE sender_chat_id == {user_id} order by date desc limit {s_max+1}"
+            query = f"""SELECT {STAR} FROM {database_name}.{table_name}
+                        WHERE sender_chat_id == {user_id} order by date desc limit {s_max+1}"""
             result = client.execute(query, {})
             has_more=False
             if len(result) >= s_max+1:
@@ -460,16 +556,21 @@ def user_brief():
         del client
         return jsonify({})
 
+'''
 @app.route('/stats_msg', methods=['GET'])
 def stats_msg():
-    # Connect to clickhouse 
+    # TODO Is this function still used ???
+    # Connect to clickhouse
     client = Client(host=clickhouse_host, port=clickhouse_port)
 
-    query = "select count(msg_id), chat_id ,chat_name from tme_prod.msg  where date > toDateTime('2024-09-04 00:00:00') and date < toDateTime('2024-09-04 23:59:59')  group by chat_id,chat_name order by count(msg_id) desc limit 25"
+    query = """select count(msg_id), chat_id ,chat_name from tme_prod.msg
+               where date > toDateTime('2024-09-04 00:00:00') and date < toDateTime('2024-09-04 23:59:59')
+               group by chat_id,chat_name order by count(msg_id) desc limit 25"""
     result = client.execute(query, {})
 
     del client
     return jsonify(result)
+'''
 
 @app.route('/index', methods=['GET'])
 def index():
@@ -477,10 +578,11 @@ def index():
     Provides last 500 messages collected 
     With "final" statement  
     '''
-    # Connect to clickhouse 
+    # Connect to clickhouse
     client = Client(host=clickhouse_host, port=clickhouse_port)
-    # query = f"select date, chat_id, msg_id, chat_name from {database_name}.{table_name} final where date > now() - INTERVAL 1 HOUR order by date desc"
-    query = f"select formatDateTime(toTimeZone(date, 'UTC'), '%%Y-%%m-%%dT%%H:%%i:%%S+00:00') AS date, chat_id, msg_id, chat_name from {database_name}.{table_name} order by insert_date desc, msg_id desc limit 500"
+    query = f"""select formatDateTime(toTimeZone(date, 'UTC'), '%%Y-%%m-%%dT%%H:%%i:%%S+00:00') AS date,
+                chat_id, msg_id, chat_name from {database_name}.{table_name} order by insert_date desc, 
+                msg_id desc limit 500"""
     result = client.execute(query, {})
 
     del client
@@ -490,10 +592,13 @@ def index():
 # Route pour les last messages
 @app.route('/count', methods=['GET'])
 def count():
-    # Connect to clickhouse 
+    '''
+        Get the messages count in the database
+    '''
+    # Connect to clickhouse
     client = Client(host=clickhouse_host, port=clickhouse_port)
 
-    query = f"select count(chat_name) from {database_name}.{table_name}"
+    query = f"select count() from {database_name}.{table_name}"
     result = client.execute(query, {})
 
     del client
@@ -513,7 +618,7 @@ def last():
     #
     #  wget "http://localhost:6000/last?since=1749342874&for=15" -O -  | jq .
     '''
-    
+
     if request.args.get('since'):
         since = request.args.get('since') # Get Unix TimeStamp
     else:
@@ -528,7 +633,7 @@ def last():
     if not valid_integer(since):   # Si bad integer = Now
         since = int(round(time.time() * 1000))
     else:
-        since = int(since)  
+        since = int(since)
     if not valid_integer(tfor):
         tfor = 5
     else:
@@ -545,13 +650,13 @@ def last():
         messages = 0
         offset = 0
 
-        # on ne demande que la date spécifé dans le post 
+        # on ne demande que la date spécifé dans le post
         # on ne prends pas les message de plus de 2 ans
         # on ne prends pas les vide
         while True:
             # Requête SQL avec pagination et limite qui ne choppe pas les texte vide
             query = f"""
-            SELECT {star} 
+            SELECT {STAR} 
             FROM {database_name}.{table_name} 
             WHERE insert_date >= toDateTime({since}) 
               AND insert_date <= toDateTime({tfor}) 
@@ -569,7 +674,7 @@ def last():
                 break
 
             # Préparer les résultats
-            column_names = valid_fields
+            column_names = VALID_FIELDS
             results_dict = [dict(zip(column_names, row)) for row in result]
             out_dict = []
 
@@ -580,14 +685,17 @@ def last():
                 msg['date'] = msg.get('date')
 
                 htext = f"On {msg.get('date')} on Telegram\n"
-                htext += f"The following data was collected from the channel {msg.get('chat_name')}/{msg.get('chat_id')} with message id {msg.get('id')}\n"
+                htext += f"The following data was collected from the channel {msg.get('chat_name')}"
+                htext += f"/{msg.get('chat_id')} with message id {msg.get('id')}\n"
                 htext += f"User {msg.get('username')}/{msg.get('sender_chat_id')} wrote\n"
                 htext += f"Subject: {msg.get('title')}\n"
                 htext += "Content: " + msg.get('text') + "\n"
                 if msg.get('msg_fwd') == 1:
-                    htext += f"It was a forward from the channel {msg.get('msg_fwd_username')}/{msg.get('msg_fwd_id')}\n"
+                    htext += f"It was a forward from the channel {msg.get('msg_fwd_username')}"
+                    htext += f"/{msg.get('msg_fwd_id')}\n"
                 if msg.get('document_present') == 1:
-                    htext += f"The document {msg.get('document_name')}/{msg.get('document_type')} with a size of {msg.get('document_size')} bytes was attached to this messages.\n"
+                    htext += f"The document {msg.get('document_name')}/{msg.get('document_type')} "
+                    htext += f"with a size of {msg.get('document_size')} bytes was attached to this messages.\n"
                 htext += f"\nThis message was acquired on {msg.get('insert_date')}\n"
 
                 out_dict.append({
@@ -613,7 +721,8 @@ def last():
 @app.route('/insert_records', methods=['POST'])
 def insert_records():
     '''
-    # Collect messages to integrate into the database.
+    Collect messages to integrate into the database.
+    Bulk insertions 
     '''
 
     data = request.get_json()
@@ -621,22 +730,22 @@ def insert_records():
         return jsonify({"error": "Invalid or missing JSON data"}), 400
 
     records = json.loads(data).get('records')
-    
+
     if not records:
         return jsonify({"error": "No records found in the JSON data"}), 400
 
     # Conversion des champs datetime pour chaque record
     records = [convert_record(record) for record in records]
 
-    # Connect to clickhouse 
+    # Connect to clickhouse
     client = Client(host=clickhouse_host, port=clickhouse_port)
 
     try:
         client.execute(f'INSERT INTO {database_name}.{table_name} VALUES', records)
-        logger.info(f"Inserted {len(records)} records into ClickHouse")
+        logger.info("Inserted %s records into ClickHouse", len(records))
         return jsonify({"status": "success", "inserted_records": len(records)}), 200
     except Exception as e:
-        logger.error(f"Failed to insert records: {e}")
+        logger.error("Failed to insert records: %s", e)
         return jsonify({"status": "error", "message": str(e)}), 500
     finally:
         del client
@@ -644,6 +753,11 @@ def insert_records():
 
 @app.route('/graph', methods=['GET'])
 def get_graph():
+    '''
+        Route to give data in json to graph in the channel view
+    '''
+
+
     chat_id = request.args.get('chat_id')
 
     clickhouse_client = Client(host=clickhouse_host, port=clickhouse_port)
@@ -682,7 +796,9 @@ def get_graph():
             nodes_map[user_id]['labels'].add(username)  # Utilisation d'un set pour stocker les labels
 
         # Liste des nœuds et des arêtes
-        nodes = [{'id': 1, 'label': f"{chat_id}\n{chat_name}", 'shape': "box", 'color':'purple'}]  # Ajouter le channel principal
+
+        # First Step Ajouter le channel principal
+        nodes = [{'id': 1, 'label': f"{chat_id}\n{chat_name}", 'shape': "box", 'color':'purple'}]
 
         edges = []
         seen_edges = set()
@@ -720,7 +836,8 @@ def get_graph():
 
                 # Ajouter le nouveau chat en rouge s'il n'existe pas déjà
                 if not any(n['id'] == other_chat_node_id for n in nodes):
-                    nodes.append({'id': other_chat_node_id, 'label': f'{other_chat_id}\n{other_chat[1]}', 'color': 'red', 'shape':'box'})
+                    nodes.append({'id': other_chat_node_id, 'label': f'{other_chat_id}\n{other_chat[1]}',
+                                  'color': 'red', 'shape':'box'})
 
                 # Vérifie si user_id est différent de other_chat_node_id avant d'ajouter l'arête
                 if str(user_id) != other_chat_node_id:
@@ -732,11 +849,13 @@ def get_graph():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
-        del clickhouse_client 
+        del clickhouse_client
 
 @app.route('/user_talk/<int:user>', methods=['GET'])
 def user_talk(user):
-    # Requête ClickHouse pour récupérer les données pour un user donné
+    '''
+        Requête ClickHouse pour récupérer les données pour un user donné
+    '''
 
     client = Client(host=clickhouse_host, port=clickhouse_port)
     query = f"""
@@ -750,21 +869,21 @@ def user_talk(user):
     GROUP BY day, chat_id, chat_name
     ORDER BY day
     """
-    
+
     # Exécuter la requête ClickHouse et obtenir le résultat
     result = client.execute(query)
     if not result:
         return jsonify({})
-    
+
     # Organiser les données dans un dictionnaire pour le traitement
     data = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-    
+
     # Remplir le dictionnaire avec les données
     for row in result:
-        day, chat_id, chat_name, count = row
+        day, chat_id, chat_name, local_count = row
         data[day][chat_id]['name'] = chat_name
-        data[day][chat_id]['count'] += count  # Incrémenter le count pour chaque chat_id et jour
-    
+        data[day][chat_id]['count'] += local_count  # Incrémenter le count pour chaque chat_id et jour
+
     # Transformer le dictionnaire en une liste de dictionnaires pour le format JSON
     formatted_data = []
     for day, chats in data.items():
@@ -775,11 +894,15 @@ def user_talk(user):
                 'chat_name': chat_info['name'],
                 'count': chat_info['count']
             })
-    del(client) 
+    del client
     return jsonify(formatted_data)
 
 @app.route('/user_dailytalk/<int:user_id>')
 def user_dailytalk(user_id):
+    '''
+        Give a heatmap data for the activity of a User. GMT based.
+    '''
+
     client = Client(host=clickhouse_host, port=clickhouse_port)
     # Requête pour récupérer les données depuis ClickHouse
     query = f"""
@@ -802,7 +925,7 @@ def user_dailytalk(user_id):
     result = client.execute(query)
     if not result:  # Si pas de data, empty reponse.
         return jsonify({})
-    
+
     # Créer des dictionnaires pour les données de la heatmap
     heatmap_data = {
         "Monday": [0] * 24,
@@ -816,7 +939,7 @@ def user_dailytalk(user_id):
 
     # Mapper les numéros de jours de la semaine (1 = Monday, 7 = Sunday) aux noms de jours
     jours_map = {
-        1: 'Monday', 2: 'Tuesday', 3: 'Wednesday', 
+        1: 'Monday', 2: 'Tuesday', 3: 'Wednesday',
         4: 'Thursday', 5: 'Friday', 6: 'Saturday', 7: 'Sunday'
     }
 
@@ -824,29 +947,35 @@ def user_dailytalk(user_id):
     for row in result:
         hour = row[0]  # Heure de la date (0-23)
         day_of_week = jours_map[row[1]]  # Jour de la semaine
-        count = row[2]  # Nombre de messages
+        local_count = row[2]  # Nombre de messages
 
         # Ajouter les messages dans le bon jour et heure
-        heatmap_data[day_of_week][hour] = count
+        heatmap_data[day_of_week][hour] = local_count
 
-    del(client)
+    del client
     # Convertir le dictionnaire en JSON
     return jsonify(heatmap_data)
 
 @app.route('/user_details/<int:user_id>')
 def user_details(user_id):
+    '''
+        Get User details 
+            Same http location at CC level
+            Give Active since and to
+            Give On which channel the user is present
+    '''
     client = Client(host=clickhouse_host, port=clickhouse_port)
     # Requête pour récupérer les données depuis ClickHouse
     if not valid_integer(user_id):
         return jsonify({'results': False})
 
-    query = f" select date from  tme_prod.msg where sender_chat_id = {user_id} order by date asc limit 1;" 
+    query = f" select date from  tme_prod.msg where sender_chat_id = {user_id} order by date asc limit 1;"
     data = client.execute(query)
     if not data:
         return jsonify({'results': False})
     date_in = data[0][0].strftime("%d/%m/%Y")
 
-    query = f" select date from  tme_prod.msg where sender_chat_id = {user_id} order by date desc limit 1;" 
+    query = f" select date from  tme_prod.msg where sender_chat_id = {user_id} order by date desc limit 1;"
     data = client.execute(query)
     date_out = data[0][0].strftime("%d/%m/%Y")
 
