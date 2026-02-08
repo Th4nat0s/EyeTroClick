@@ -230,6 +230,73 @@ def search():
         del client
         return jsonify({'error': str(e)}), 500
 
+# Route pour la recherche combinée channel + texte
+@app.route('/search_channel_text', methods=['GET'])
+def search_channel_text():
+    '''
+    Search text inside a single channel with LIKE/ILIKE on the text field.
+    '''
+    start_time = time.time()
+    client = Client(host=clickhouse_host, port=clickhouse_port)
+
+    chat_id = request.args.get('chat_id')
+    text = request.args.get('text')
+    method = request.args.get('method', 'ILIKE')
+    local_count = request.args.get('count')
+
+    if not chat_id or not text:
+        return jsonify({'error': 'Missing chat_id or text parameter'}), 400
+
+    if not valid_integer(chat_id):
+        return jsonify({'error': 'Invalid chat_id'}), 400
+
+    try:
+        local_count = int(local_count) if local_count else 100
+        if local_count > 50:
+            return jsonify({'error': 'Count exceeds limits'}), 400
+    except ValueError:
+        return jsonify({'error': 'Invalid Count'}), 400
+
+    method = method.lower()
+    if method not in ('like', 'ilike'):
+        return jsonify({'error': 'Invalid method parameter'}), 400
+
+    if method == 'like':
+        query = f"""SELECT {STAR}
+                    FROM {database_name}.{table_name}
+                    WHERE chat_id = %(chat_id)s AND text LIKE %(value)s
+                    order by date desc limit {local_count}"""
+        params = {'chat_id': int(chat_id), 'value': f'%{text}%'}
+    else:
+        query = f"""SELECT {STAR}
+                    FROM {database_name}.{table_name}
+                    WHERE chat_id = %(chat_id)s
+                      AND positionCaseInsensitiveUTF8(text, %(value)s) > 0
+                    order by date desc limit {local_count}"""
+        params = {'chat_id': int(chat_id), 'value': f'{text}'}
+
+    try:
+        result = client.execute(query, params)
+        column_names = VALID_FIELDS
+        results_dict = [dict(zip(column_names, row)) for row in result]
+        len_result = len(result)
+
+        if len_result >= local_count:
+            has_more = "True"
+            results_dict = results_dict[:-1]
+        else:
+            has_more = "False"
+
+        timing = float(time.time() - start_time)
+        timing = f"{timing:.5f}"
+        del client
+        results = {'has_more': has_more, 'results': results_dict, 'timing': timing}
+        return jsonify(results)
+    except Exception as e:
+        print(f"error: {e}, \n {query}")
+        del client
+        return jsonify({'error': str(e)}), 500
+
 # Route pour avoir plein de messages
 @app.route('/get_bulk_msgs', methods=['POST'])
 def get_bulk_msg():
