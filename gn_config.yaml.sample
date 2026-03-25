@@ -4,3 +4,5 @@ clickhouse_port: 9000
 app_port: 6000
 database_name: 'mytme'
 table_name: 'lesmsg'
+libretranslate_url: 'http://127.0.0.1:5050'
+libretranslate_api_key: ''

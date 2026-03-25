@@ -1,0 +1,49 @@
+LibreTranslate local setup in this repo
+
+The LibreTranslate files are in the repo subdirectory:
+
+./libretranslate
+
+Install steps used here
+
+cd libretranslate/
+vi requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+ls
+
+Current requirements.txt
+
+libretranslate
+
+Run LibreTranslate locally
+
+From the libretranslate directory:
+
+source .venv/bin/activate
+libretranslate --host 127.0.0.1 --port 5050
+
+or without activating the venv:
+
+./.venv/bin/libretranslate --host 127.0.0.1 --port 5050
+
+LibreTranslate then listens on:
+
+http://127.0.0.1:5050
+
+Use with EyeTroClick
+
+Set the backend config to:
+
+libretranslate_url: 'http://127.0.0.1:5050'
+
+Then restart db_svr.py.
+
+Quick test
+
+http://127.0.0.1:6000/translate?LSRC=EN&LDST=JA&TEXT=Hello%20world
+
+Helper script
+
+Use start_libretranslate.cmd in this same directory to start the local service on 127.0.0.1:5050.

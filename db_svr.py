@@ -17,11 +17,13 @@ import json
 from datetime import datetime, timedelta, date, timezone
 from collections import defaultdict
 from email.utils import parsedate_to_datetime
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 
 import yaml
 from flask import Flask, request, jsonify, Response
 from clickhouse_driver import Client
+from libretranslatepy import LibreTranslateAPI
 
 app = Flask(__name__)
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -35,6 +37,14 @@ clickhouse_port = gn_config.get("clickhouse_port")
 app_port = gn_config.get("app_port")
 database_name = gn_config.get("database_name")
 table_name = gn_config.get("table_name")
+libretranslate_url = (
+    os.environ.get("LIBRETRANSLATE_URL")
+    or gn_config.get("libretranslate_url")
+    or LibreTranslateAPI.DEFAULT_URL
+)
+libretranslate_api_key = (
+    os.environ.get("LIBRETRANSLATE_API_KEY") or gn_config.get("libretranslate_api_key")
+)
 logger = logging.getLogger(__name__)
 
 # Liste des colonnes valides pour éviter les injections SQL
@@ -480,6 +490,19 @@ def valid_integer(value):
         return True
     except ValueError:
         return False
+
+
+def _normalize_language_code(value):
+    if value is None:
+        return None
+    return str(value).strip().lower()
+
+
+def _translate_text(source_lang, target_lang, text):
+    translator = LibreTranslateAPI(
+        url=libretranslate_url, api_key=libretranslate_api_key
+    )
+    return translator.translate(text, source_lang, target_lang, timeout=15)
 
 
 @app.route("/", methods=["GET"])
@@ -1028,6 +1051,91 @@ def home():
     html_page = html_page.replace("__MESSAGE_COUNT__", message_count_text)
     html_page = html_page.replace("__CHATROOM_COUNT__", chat_room_count_text)
     return Response(html_page, mimetype="text/html")
+
+
+@app.route("/translate", methods=["GET"])
+def translate_text():
+    """
+    Translate text from LSRC to LDST using LibreTranslate.
+    """
+    source_lang = _normalize_language_code(
+        request.args.get("LSRC") or request.args.get("lsrc")
+    )
+    target_lang = _normalize_language_code(
+        request.args.get("LDST") or request.args.get("ldst")
+    )
+    text = request.args.get("TEXT") or request.args.get("text")
+
+    if not source_lang or not target_lang or text is None:
+        return jsonify({"error": "Missing LSRC, LDST or TEXT parameter"}), 400
+
+    if not str(text).strip():
+        return jsonify({"error": "TEXT parameter cannot be empty"}), 400
+
+    if source_lang == target_lang:
+        return jsonify(
+            {
+                "source": source_lang,
+                "target": target_lang,
+                "original_text": text,
+                "translated_text": text,
+                "provider": "LibreTranslate",
+                "service_url": libretranslate_url,
+            }
+        )
+
+    try:
+        translated_text = _translate_text(source_lang, target_lang, text)
+    except HTTPError as exc:
+        logger.warning("LibreTranslate HTTP error: %s", exc)
+        error_body = None
+        upstream_error = None
+        try:
+            raw_body = exc.read().decode("utf-8", errors="replace")
+            if raw_body:
+                error_body = raw_body
+                parsed_body = json.loads(raw_body)
+                if isinstance(parsed_body, dict):
+                    upstream_error = parsed_body.get("error")
+        except Exception:
+            error_body = None
+
+        payload = {
+            "error": f"LibreTranslate HTTP error: {exc.reason}",
+            "service_url": libretranslate_url,
+        }
+        if upstream_error:
+            payload["upstream_error"] = upstream_error
+        elif error_body:
+            payload["upstream_response"] = error_body
+        return jsonify(payload), exc.code
+    except URLError as exc:
+        logger.warning("LibreTranslate network error: %s", exc)
+        reason = getattr(exc, "reason", str(exc))
+        payload = {
+            "error": f"LibreTranslate network error: {reason}",
+            "service_url": libretranslate_url,
+        }
+        if isinstance(reason, ConnectionRefusedError) or "[Errno 111]" in str(reason):
+            payload["hint"] = (
+                "LibreTranslate is not listening on the configured URL. "
+                "Start ./libretranslate/start_libretranslate.cmd or update libretranslate_url."
+            )
+        return jsonify(payload), 502
+    except Exception as exc:
+        logger.exception("LibreTranslate unexpected error")
+        return jsonify({"error": str(exc)}), 500
+
+    return jsonify(
+        {
+            "source": source_lang,
+            "target": target_lang,
+            "original_text": text,
+            "translated_text": translated_text,
+            "provider": "LibreTranslate",
+            "service_url": libretranslate_url,
+        }
+    )
 
 
 @app.route("/search_go_telegrams", methods=["POST"])
