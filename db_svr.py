@@ -19,11 +19,18 @@ from collections import defaultdict
 from email.utils import parsedate_to_datetime
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import yaml
 from flask import Flask, request, jsonify, Response
 from clickhouse_driver import Client
-from libretranslatepy import LibreTranslateAPI
+
+try:
+    from libretranslatepy import LibreTranslateAPI
+    LIBRETRANSLATE_IMPORT_ERROR = None
+except Exception as exc:
+    LibreTranslateAPI = None
+    LIBRETRANSLATE_IMPORT_ERROR = exc
 
 app = Flask(__name__)
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -37,15 +44,21 @@ clickhouse_port = gn_config.get("clickhouse_port")
 app_port = gn_config.get("app_port")
 database_name = gn_config.get("database_name")
 table_name = gn_config.get("table_name")
+DEFAULT_LIBRETRANSLATE_URL = "http://127.0.0.1:5050"
 libretranslate_url = (
     os.environ.get("LIBRETRANSLATE_URL")
     or gn_config.get("libretranslate_url")
-    or LibreTranslateAPI.DEFAULT_URL
+    or (
+        LibreTranslateAPI.DEFAULT_URL
+        if LibreTranslateAPI is not None
+        else DEFAULT_LIBRETRANSLATE_URL
+    )
 )
 libretranslate_api_key = (
     os.environ.get("LIBRETRANSLATE_API_KEY") or gn_config.get("libretranslate_api_key")
 )
 logger = logging.getLogger(__name__)
+_logged_libretranslate_fallback = False
 
 # Liste des colonnes valides pour éviter les injections SQL
 valid_fields = [
@@ -499,10 +512,47 @@ def _normalize_language_code(value):
 
 
 def _translate_text(source_lang, target_lang, text):
-    translator = LibreTranslateAPI(
-        url=libretranslate_url, api_key=libretranslate_api_key
+    global _logged_libretranslate_fallback
+    if LibreTranslateAPI is not None:
+        translator = LibreTranslateAPI(
+            url=libretranslate_url, api_key=libretranslate_api_key
+        )
+        return translator.translate(text, source_lang, target_lang, timeout=15)
+
+    if LIBRETRANSLATE_IMPORT_ERROR is not None and not _logged_libretranslate_fallback:
+        logger.warning(
+            "libretranslatepy unavailable, falling back to urllib: %s",
+            LIBRETRANSLATE_IMPORT_ERROR,
+        )
+        _logged_libretranslate_fallback = True
+
+    payload = {
+        "q": text,
+        "source": source_lang,
+        "target": target_lang,
+        "format": "text",
+    }
+    if libretranslate_api_key:
+        payload["api_key"] = libretranslate_api_key
+
+    request = Request(
+        libretranslate_url.rstrip("/") + "/translate",
+        data=urlencode(payload).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
     )
-    return translator.translate(text, source_lang, target_lang, timeout=15)
+
+    with urlopen(request, timeout=15) as response:
+        charset = response.headers.get_content_charset() or "utf-8"
+        body = response.read().decode(charset, errors="replace")
+
+    parsed = json.loads(body)
+    translated_text = parsed.get("translatedText") if isinstance(parsed, dict) else None
+    if translated_text is None:
+        raise ValueError("Unexpected LibreTranslate response")
+    return translated_text
 
 
 @app.route("/", methods=["GET"])
