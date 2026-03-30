@@ -6,7 +6,7 @@
 import argparse
 import logging
 import os
-from typing import Iterable
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import requests
 import yaml
@@ -20,7 +20,7 @@ CONFIG_PATH = os.path.join(THIS_DIR, "gn_config.yaml")
 MAX_BATCH_SIZE = 10_000
 
 
-def load_config(config_path: str) -> dict:
+def load_config(config_path: str) -> Dict[str, object]:
     """Load and validate the YAML configuration file."""
     with open(config_path, "r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle) or {}
@@ -40,11 +40,11 @@ def load_config(config_path: str) -> dict:
 
 
 def fetch_last_ids_batch(
-    config: dict,
+    config: Dict[str, object],
     after_telegram_id: int = 0,
-    telegram_id: int | None = None,
+    telegram_id: Optional[int] = None,
     batch_size: int = MAX_BATCH_SIZE,
-) -> list[dict]:
+) -> List[Dict[str, object]]:
     """Fetch one batch of consolidated last_id values from ClickHouse."""
     if batch_size < 1 or batch_size > MAX_BATCH_SIZE:
         raise ValueError(f"batch_size must be between 1 and {MAX_BATCH_SIZE}")
@@ -96,11 +96,11 @@ def fetch_last_ids_batch(
 
 
 def fetch_last_ids(
-    config: dict,
-    telegram_id: int | None = None,
+    config: Dict[str, object],
+    telegram_id: Optional[int] = None,
     batch_size: int = MAX_BATCH_SIZE,
-    limit: int | None = None,
-) -> Iterable[list[dict]]:
+    limit: Optional[int] = None,
+) -> Iterator[List[Dict[str, object]]]:
     """Yield batches of telegram_id/last_id rows."""
     if telegram_id is not None:
         rows = fetch_last_ids_batch(
@@ -134,7 +134,7 @@ def fetch_last_ids(
         after_telegram_id = rows[-1]["telegram_id"]
 
 
-def build_uri(row: dict) -> str:
+def build_uri(row: Dict[str, object]) -> str:
     """Build a backend-compatible Telegram URI for a channel row."""
     chat_name = (row.get("chat_name") or "").strip()
     if chat_name:
@@ -145,7 +145,10 @@ def build_uri(row: dict) -> str:
     return f"https://t.me/{row['telegram_id']}"
 
 
-def iter_payloads(rows: Iterable[dict], api_key: str) -> Iterable[dict]:
+def iter_payloads(
+    rows: Iterable[Dict[str, object]],
+    api_key: str,
+) -> Iterator[Dict[str, object]]:
     """Convert ClickHouse rows into backend payloads."""
     for row in rows:
         yield {
@@ -157,7 +160,11 @@ def iter_payloads(rows: Iterable[dict], api_key: str) -> Iterable[dict]:
         }
 
 
-def push_last_ids(config: dict, rows: list[dict], dry_run: bool = False) -> tuple[int, int]:
+def push_last_ids(
+    config: Dict[str, object],
+    rows: List[Dict[str, object]],
+    dry_run: bool = False,
+) -> Tuple[int, int]:
     """Push one batch of last_id updates to the backend."""
     success = 0
     failure = 0
