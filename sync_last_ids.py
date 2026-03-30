@@ -156,6 +156,7 @@ def iter_payloads(
             "uri": build_uri(row),
             "telegram_id": str(row["telegram_id"]),
             "last_id": row["last_id"],
+            "touch_last_seen": False,
             "type": "Telegram",
         }
 
