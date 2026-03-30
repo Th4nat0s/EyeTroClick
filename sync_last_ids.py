@@ -6,6 +6,7 @@
 import argparse
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import requests
@@ -39,13 +40,61 @@ def load_config(config_path: str) -> Dict[str, object]:
     return config
 
 
+def resolve_message_date_column(config: Dict[str, object]) -> str:
+    """Detect the ClickHouse message timestamp column."""
+    client = Client(
+        host=config["clickhouse_host"],
+        port=config["clickhouse_port"],
+    )
+    query = """
+        SELECT name
+        FROM system.columns
+        WHERE database = %(database)s
+          AND table = %(table)s
+          AND name IN ('date', 'date_utc')
+    """
+    params = {
+        "database": config["database_name"],
+        "table": config["table_name"],
+    }
+
+    try:
+        rows = client.execute(query, params)
+    finally:
+        client.disconnect()
+
+    available = {row[0] for row in rows}
+    if "date" in available:
+        return "date"
+    if "date_utc" in available:
+        return "date_utc"
+    raise ValueError("Unable to detect message date column: expected date or date_utc")
+
+
+def format_backend_datetime(value: object) -> str:
+    """Format a ClickHouse datetime value for the backend API."""
+    if isinstance(value, datetime):
+        dt_value = value
+    else:
+        normalized = str(value).strip().replace(" ", "T")
+        dt_value = datetime.fromisoformat(normalized)
+
+    if dt_value.tzinfo is None:
+        dt_value = dt_value.replace(tzinfo=timezone.utc)
+    else:
+        dt_value = dt_value.astimezone(timezone.utc)
+
+    return dt_value.isoformat(timespec="seconds")
+
+
 def fetch_last_ids_batch(
     config: Dict[str, object],
+    date_column: str,
     after_telegram_id: int = 0,
     telegram_id: Optional[int] = None,
     batch_size: int = MAX_BATCH_SIZE,
 ) -> List[Dict[str, object]]:
-    """Fetch one batch of consolidated last_id values from ClickHouse."""
+    """Fetch one batch of consolidated last_id and last_msg values."""
     if batch_size < 1 or batch_size > MAX_BATCH_SIZE:
         raise ValueError(f"batch_size must be between 1 and {MAX_BATCH_SIZE}")
 
@@ -71,7 +120,8 @@ def fetch_last_ids_batch(
         SELECT
             abs(chat_id) AS telegram_id,
             argMax(chat_name, msg_id) AS chat_name,
-            max(msg_id) AS last_id
+            max(msg_id) AS last_id,
+            argMax({date_column}, msg_id) AS last_msg
         FROM {config["database_name"]}.{config["table_name"]}
         {where_clause}
         GROUP BY telegram_id
@@ -89,22 +139,25 @@ def fetch_last_ids_batch(
             "telegram_id": int(row[0]),
             "chat_name": row[1] or "",
             "last_id": int(row[2]),
+            "last_msg": format_backend_datetime(row[3]),
         }
         for row in rows
-        if row[0] is not None and row[2] is not None
+        if row[0] is not None and row[2] is not None and row[3] is not None
     ]
 
 
 def fetch_last_ids(
     config: Dict[str, object],
+    date_column: str,
     telegram_id: Optional[int] = None,
     batch_size: int = MAX_BATCH_SIZE,
     limit: Optional[int] = None,
 ) -> Iterator[List[Dict[str, object]]]:
-    """Yield batches of telegram_id/last_id rows."""
+    """Yield batches of telegram_id/last_id/last_msg rows."""
     if telegram_id is not None:
         rows = fetch_last_ids_batch(
             config,
+            date_column=date_column,
             telegram_id=telegram_id,
             batch_size=1,
         )
@@ -123,6 +176,7 @@ def fetch_last_ids(
         current_batch_size = batch_size if remaining is None else min(batch_size, remaining)
         rows = fetch_last_ids_batch(
             config,
+            date_column=date_column,
             after_telegram_id=after_telegram_id,
             batch_size=current_batch_size,
         )
@@ -156,6 +210,7 @@ def iter_payloads(
             "uri": build_uri(row),
             "telegram_id": str(row["telegram_id"]),
             "last_id": row["last_id"],
+            "last_msg": row["last_msg"],
             "touch_last_seen": False,
             "type": "Telegram",
         }
@@ -254,12 +309,14 @@ def main() -> int:
 
     try:
         config = load_config(args.config)
+        date_column = resolve_message_date_column(config)
         if args.batch_size < 1 or args.batch_size > MAX_BATCH_SIZE:
             raise ValueError(
                 f"--batch-size must be between 1 and {MAX_BATCH_SIZE}"
             )
         batches = fetch_last_ids(
             config,
+            date_column=date_column,
             telegram_id=args.telegram_id,
             batch_size=args.batch_size,
             limit=args.limit,
