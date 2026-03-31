@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # coding=utf-8
 
-"""Synchronise les last_id Telegram depuis ClickHouse vers le backend."""
+"""Synchronise les bornes de messages Telegram depuis ClickHouse vers le backend."""
 
 import argparse
 import logging
@@ -94,7 +94,7 @@ def fetch_last_ids_batch(
     telegram_id: Optional[int] = None,
     batch_size: int = MAX_BATCH_SIZE,
 ) -> List[Dict[str, object]]:
-    """Fetch one batch of consolidated last_id and last_msg values."""
+    """Fetch one batch of consolidated first/last message stats."""
     if batch_size < 1 or batch_size > MAX_BATCH_SIZE:
         raise ValueError(f"batch_size must be between 1 and {MAX_BATCH_SIZE}")
 
@@ -120,6 +120,8 @@ def fetch_last_ids_batch(
         SELECT
             abs(chat_id) AS telegram_id,
             argMax(chat_name, msg_id) AS chat_name,
+            min(msg_id) AS first_id,
+            argMin({date_column}, msg_id) AS first_msg,
             max(msg_id) AS last_id,
             argMax({date_column}, msg_id) AS last_msg
         FROM {config["database_name"]}.{config["table_name"]}
@@ -138,11 +140,19 @@ def fetch_last_ids_batch(
         {
             "telegram_id": int(row[0]),
             "chat_name": row[1] or "",
-            "last_id": int(row[2]),
-            "last_msg": format_backend_datetime(row[3]),
+            "first_id": int(row[2]),
+            "first_msg": format_backend_datetime(row[3]),
+            "last_id": int(row[4]),
+            "last_msg": format_backend_datetime(row[5]),
         }
         for row in rows
-        if row[0] is not None and row[2] is not None and row[3] is not None
+        if (
+            row[0] is not None
+            and row[2] is not None
+            and row[3] is not None
+            and row[4] is not None
+            and row[5] is not None
+        )
     ]
 
 
@@ -153,7 +163,7 @@ def fetch_last_ids(
     batch_size: int = MAX_BATCH_SIZE,
     limit: Optional[int] = None,
 ) -> Iterator[List[Dict[str, object]]]:
-    """Yield batches of telegram_id/last_id/last_msg rows."""
+    """Yield batches of telegram_id/first+last message stats."""
     if telegram_id is not None:
         rows = fetch_last_ids_batch(
             config,
@@ -209,8 +219,10 @@ def iter_payloads(
             "api_key": api_key,
             "uri": build_uri(row),
             "telegram_id": str(row["telegram_id"]),
+            "first_msg": row["first_msg"],
             "last_id": row["last_id"],
             "last_msg": row["last_msg"],
+            "first_blood": True,
             "touch_last_seen": False,
             "type": "Telegram",
         }
