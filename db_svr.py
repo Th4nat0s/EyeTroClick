@@ -1754,7 +1754,20 @@ def last():
         tfor = int(tfor)
     tfor = (tfor * 60) + since  # convert to millisec
 
-    page_size = 50000  # Taille des records par réponse (chunk)
+    if request.args.get('per_page'):
+        page_size = request.args.get('per_page') # minutes to fetch
+    else:
+        page_size = 50000  # Taille des records par réponse (chunk)
+
+     if request.args.get('page'):
+        page = request.args.get('page') # minutes to fetch
+    else:
+        page = None
+
+    if page is not None:
+        real_offset = page_size * page
+    else:
+        real_offset = None
 
     def generate():
         """
@@ -1763,7 +1776,10 @@ def last():
         client = Client(host=clickhouse_host, port=clickhouse_port)
 
         messages = 0
-        offset = 0
+        if real_offset is not None:
+            offset = real_offset
+        else:
+            offset = 0
 
         # on ne demande que la date spécifé dans le post
         # on ne prends pas les message de plus de 2 ans
@@ -1830,6 +1846,9 @@ def last():
                 {"results": out_dict, "length": len(out_dict)},
                 default=serialize_datetime,
             ) + "\n"
+
+            if real_offset is not None:
+                break
 
             # Incrémenter l'offset pour la page suivante
             offset += page_size
