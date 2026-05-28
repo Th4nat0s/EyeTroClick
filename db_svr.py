@@ -1554,6 +1554,51 @@ def get_channel(channel_id):
     return jsonify(payload)
 
 
+@app.route("/getchatrandoms/<int:count>", methods=["GET"])
+def getchatrandoms(count):
+    """
+    Get random Telegram chat ids from local SQLite app.db comms table.
+
+    Only chats with last_id > 300 are eligible.
+    """
+    if count < 1:
+        return jsonify({"error": "Invalid count"}), 400
+    if count > 1000:
+        count = 1000
+
+    try:
+        with sqlite3.connect(APP_DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT telegram_id, telegram_name, link, description, last_id
+                FROM comms
+                WHERE telegram_id IS NOT NULL
+                  AND telegram_id != ''
+                  AND last_id > 300
+                ORDER BY RANDOM()
+                LIMIT ?
+                """,
+                (count,),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        logger.warning("SQLite random chat lookup failed: %s", exc)
+        return jsonify({"error": "sqlite lookup failed"}), 500
+
+    chats = [
+        {
+            "channel_id": row["telegram_id"],
+            "channel_name": row["telegram_name"],
+            "url": row["link"],
+            "description": row["description"],
+            "last_id": row["last_id"],
+        }
+        for row in rows
+    ]
+
+    return jsonify({"results": True, "count": len(chats), "chats": chats})
+
+
 # Routes pour les stats
 @app.route("/get_stats_chan", methods=["GET"])
 def get_stats_chan():
