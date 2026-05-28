@@ -14,6 +14,7 @@ import os
 import logging
 import hashlib
 import json
+import sqlite3
 from datetime import datetime, timedelta, date, timezone
 from collections import defaultdict
 from email.utils import parsedate_to_datetime
@@ -36,6 +37,7 @@ app = Flask(__name__)
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(THIS_DIR, "./gn_config.yaml")) as f:
     gn_config = yaml.safe_load(f)
+APP_DB_PATH = os.path.join(THIS_DIR, "app.db")
 
 # Configuration de la connexion
 # clickhouse_host = 'localhost'
@@ -503,6 +505,16 @@ def valid_integer(value):
         return True
     except ValueError:
         return False
+
+
+def request_flag_enabled(*names):
+    """Return True when any query flag is present and not false-like."""
+    false_values = {"", "0", "false", "no", "off"}
+    for name in names:
+        if name in request.args:
+            value = request.args.get(name, "1")
+            return str(value).lower() not in false_values
+    return False
 
 
 def _normalize_language_code(value):
@@ -1450,6 +1462,96 @@ def get_msg():
     finally:
         if client:
             client.disconnect()
+
+
+@app.route("/get_channel/<int:channel_id>", methods=["GET"])
+def get_channel(channel_id):
+    """
+    Get Telegram channel metadata from local SQLite app.db comms table.
+
+    channel_id is matched against comms.telegram_id first.
+    If no channel matches, comms.id is used as fallback.
+    """
+    channel_id_raw = str(channel_id)
+    channel_id_abs = str(abs(channel_id))
+    include_ids = request_flag_enabled("id", "ids", "--id")
+    include_timestamps = request_flag_enabled("timestamp", "timestamps", "--timestamp")
+
+    try:
+        with sqlite3.connect(APP_DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT id, telegram_id, telegram_name, link, description
+                FROM comms
+                WHERE telegram_id IN (?, ?)
+                ORDER BY CASE WHEN telegram_id = ? THEN 0 ELSE 1 END
+                LIMIT 1
+                """,
+                (channel_id_raw, channel_id_abs, channel_id_raw),
+            ).fetchone()
+
+            if row is None:
+                row = conn.execute(
+                    """
+                    SELECT id, telegram_id, telegram_name, link, description
+                    FROM comms
+                    WHERE id = ?
+                    LIMIT 1
+                    """,
+                    (channel_id,),
+                ).fetchone()
+    except sqlite3.Error as exc:
+        logger.warning("SQLite channel lookup failed for %s: %s", channel_id, exc)
+        return jsonify({"error": "sqlite lookup failed"}), 500
+
+    if row is None:
+        return jsonify({"results": False}), 404
+
+    client = None
+    try:
+        client = Client(host=clickhouse_host, port=clickhouse_port)
+        messages_result = client.execute(
+            f"""
+            SELECT {star}
+            FROM {database_name}.{table_name}
+            WHERE abs(chat_id) = %(channel_id)s
+            ORDER BY {DATE_COLUMN} DESC
+            LIMIT 100
+            """,
+            {"channel_id": int(row["telegram_id"])},
+        )
+    except Exception as exc:
+        logger.warning("ClickHouse message lookup failed for %s: %s", channel_id, exc)
+        return jsonify({"error": "clickhouse lookup failed"}), 500
+    finally:
+        if client:
+            client.disconnect()
+
+    messages = []
+    id_fields = {"id", "chat_id", "sender_chat_id", "msg_fwd_id"}
+    timestamp_fields = {"date", "insert_date"}
+    for item in messages_result:
+        message = dict(zip(valid_fields, item))
+        if not include_ids:
+            for field in id_fields:
+                message.pop(field, None)
+        if not include_timestamps:
+            for field in timestamp_fields:
+                message.pop(field, None)
+        messages.append(message)
+
+    payload = {
+        "results": True,
+        "channel_name": row["telegram_name"],
+        "url": row["link"],
+        "description": row["description"],
+        "messages": messages,
+    }
+    if include_ids:
+        payload["channel_id"] = row["telegram_id"]
+
+    return jsonify(payload)
 
 
 # Routes pour les stats
