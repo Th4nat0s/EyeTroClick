@@ -130,7 +130,7 @@ HTTP `500` when message lookup fails.
 
 ## GET /getchatrandoms/<count>
 
-Return random Telegram chats from SQLite only.
+Return random Telegram chats from SQLite, validated against ClickHouse.
 
 Filters:
 
@@ -141,6 +141,10 @@ last_id > 300
 ```
 
 `count` is capped at `1000`.
+
+Each selected channel is checked in ClickHouse. If ClickHouse has no messages
+for that `telegram_id`, the channel is disabled for this route by setting
+`comms.last_id = 0`, then another random channel is selected when possible.
 
 Example:
 
@@ -154,6 +158,7 @@ Response:
 {
   "results": true,
   "count": 10,
+  "disabled_empty_channels": 0,
   "chats": [
     {
       "channel_id": "1001737065444",

@@ -1560,43 +1560,113 @@ def getchatrandoms(count):
     Get random Telegram chat ids from local SQLite app.db comms table.
 
     Only chats with last_id > 300 are eligible.
+    Channels with no messages in ClickHouse are disabled for this route by
+    setting last_id to 0, then replaced by another random channel when possible.
     """
     if count < 1:
         return jsonify({"error": "Invalid count"}), 400
     if count > 1000:
         count = 1000
 
+    chats = []
+    disabled_count = 0
+    seen_comm_ids = set()
+    attempts = 0
+    max_attempts = 20
+
     try:
         with sqlite3.connect(APP_DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                """
-                SELECT telegram_id, telegram_name, link, description, last_id
-                FROM comms
-                WHERE telegram_id IS NOT NULL
-                  AND telegram_id != ''
-                  AND last_id > 300
-                ORDER BY RANDOM()
-                LIMIT ?
-                """,
-                (count,),
-            ).fetchall()
+            client = Client(host=clickhouse_host, port=clickhouse_port)
+            try:
+                while len(chats) < count and attempts < max_attempts:
+                    attempts += 1
+                    remaining = count - len(chats)
+                    batch_size = min(max(remaining * 3, 25), 1000)
+                    rows = conn.execute(
+                        """
+                        SELECT id, telegram_id, telegram_name, link, description, last_id
+                        FROM comms
+                        WHERE telegram_id IS NOT NULL
+                          AND telegram_id != ''
+                          AND last_id > 300
+                        ORDER BY RANDOM()
+                        LIMIT ?
+                        """,
+                        (batch_size,),
+                    ).fetchall()
+                    rows = [row for row in rows if row["id"] not in seen_comm_ids]
+                    if not rows:
+                        break
+
+                    channel_ids = []
+                    rows_by_channel_id = {}
+                    invalid_comm_ids = []
+                    for row in rows:
+                        seen_comm_ids.add(row["id"])
+                        try:
+                            channel_id = abs(int(row["telegram_id"]))
+                        except (TypeError, ValueError):
+                            invalid_comm_ids.append(row["id"])
+                            continue
+                        channel_ids.append(channel_id)
+                        rows_by_channel_id[channel_id] = row
+
+                    channel_ids = list(dict.fromkeys(channel_ids))
+                    message_channel_ids = set()
+                    if channel_ids:
+                        result = client.execute(
+                            f"""
+                            SELECT abs(chat_id)
+                            FROM {database_name}.{table_name}
+                            WHERE abs(chat_id) IN %(channel_ids)s
+                            GROUP BY abs(chat_id)
+                            """,
+                            {"channel_ids": tuple(channel_ids)},
+                        )
+                        message_channel_ids = {int(row[0]) for row in result}
+
+                    disabled_comm_ids = list(invalid_comm_ids)
+                    for channel_id, row in rows_by_channel_id.items():
+                        if channel_id not in message_channel_ids:
+                            disabled_comm_ids.append(row["id"])
+                            continue
+                        chats.append(
+                            {
+                                "channel_id": row["telegram_id"],
+                                "channel_name": row["telegram_name"],
+                                "url": row["link"],
+                                "description": row["description"],
+                                "last_id": row["last_id"],
+                            }
+                        )
+                        if len(chats) >= count:
+                            break
+
+                    if disabled_comm_ids:
+                        conn.executemany(
+                            "UPDATE comms SET last_id = 0 WHERE id = ?",
+                            [(comm_id,) for comm_id in disabled_comm_ids],
+                        )
+                        conn.commit()
+                        disabled_count += len(disabled_comm_ids)
+            finally:
+                client.disconnect()
     except sqlite3.Error as exc:
         logger.warning("SQLite random chat lookup failed: %s", exc)
         return jsonify({"error": "sqlite lookup failed"}), 500
+    except Exception as exc:
+        logger.warning("ClickHouse random chat validation failed: %s", exc)
+        return jsonify({"error": "clickhouse lookup failed"}), 500
 
-    chats = [
+    return jsonify(
         {
-            "channel_id": row["telegram_id"],
-            "channel_name": row["telegram_name"],
-            "url": row["link"],
-            "description": row["description"],
-            "last_id": row["last_id"],
+            "results": True,
+            "count": len(chats),
+            "disabled_empty_channels": disabled_count,
+            "chats": chats,
         }
-        for row in rows
-    ]
-
-    return jsonify({"results": True, "count": len(chats), "chats": chats})
+    )
 
 
 # Routes pour les stats
