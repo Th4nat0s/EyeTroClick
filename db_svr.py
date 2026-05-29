@@ -517,6 +517,15 @@ def request_flag_enabled(*names):
     return False
 
 
+def disable_channel_for_empty_messages(comm_id):
+    try:
+        with sqlite3.connect(APP_DB_PATH) as conn:
+            conn.execute("UPDATE comms SET last_id = 0 WHERE id = ?", (comm_id,))
+            conn.commit()
+    except sqlite3.Error as exc:
+        logger.warning("Unable to disable empty channel %s: %s", comm_id, exc)
+
+
 def _normalize_language_code(value):
     if value is None:
         return None
@@ -1527,6 +1536,10 @@ def get_channel(channel_id):
     finally:
         if client:
             client.disconnect()
+
+    if not messages_result:
+        disable_channel_for_empty_messages(row["id"])
+        return jsonify({"results": False, "error": "channel has no messages"}), 404
 
     messages = []
     id_fields = {"id", "chat_id", "sender_chat_id", "msg_fwd_id"}
