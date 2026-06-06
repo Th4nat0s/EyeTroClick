@@ -1485,6 +1485,17 @@ def get_channel(channel_id):
     channel_id_abs = str(abs(channel_id))
     include_ids = request_flag_enabled("id", "ids", "--id")
     include_timestamps = request_flag_enabled("timestamp", "timestamps", "--timestamp")
+    limit_param = request.args.get("limit")
+
+    try:
+        message_limit = int(limit_param) if limit_param else 100
+    except ValueError:
+        return jsonify({"error": "Invalid limit"}), 400
+
+    if message_limit < 1:
+        message_limit = 1
+    if message_limit > 65000:
+        message_limit = 65000
 
     try:
         with sqlite3.connect(APP_DB_PATH) as conn:
@@ -1526,9 +1537,9 @@ def get_channel(channel_id):
             FROM {database_name}.{table_name}
             WHERE abs(chat_id) = %(channel_id)s
             ORDER BY {DATE_COLUMN} DESC
-            LIMIT 100
+            LIMIT %(message_limit)s
             """,
-            {"channel_id": int(row["telegram_id"])},
+            {"channel_id": int(row["telegram_id"]), "message_limit": message_limit},
         )
     except Exception as exc:
         logger.warning("ClickHouse message lookup failed for %s: %s", channel_id, exc)

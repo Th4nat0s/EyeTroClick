@@ -44,7 +44,13 @@ Message content comes from ClickHouse unless route says SQLite only.
 
 ## GET /get_channel/<channel_id>
 
-Return metadata for one Telegram channel and its 100 latest messages.
+Return metadata for one Telegram channel and its latest messages.
+
+Optional query parameters:
+
+- `limit=<count>`: number of messages to return. Default `100`, minimum `1`, maximum `65000`.
+- `id=1`: include message/channel IDs.
+- `timestamp=1`: include message timestamps.
 
 Channel lookup uses SQLite `comms.telegram_id` first. If no row matches, it falls back to SQLite `comms.id`.
 
@@ -53,13 +59,19 @@ Messages are read from ClickHouse with:
 ```sql
 abs(chat_id) = telegram_id
 ORDER BY date DESC
-LIMIT 100
+LIMIT <limit>
 ```
 
 Default call:
 
 ```bash
 wget -qO- "http://127.0.0.1:6000/get_channel/1001737065444" | jq .
+```
+
+Custom message count:
+
+```bash
+wget -qO- "http://127.0.0.1:6000/get_channel/1001737065444?limit=250" | jq .
 ```
 
 Response:
@@ -87,7 +99,7 @@ Response:
 With IDs and timestamps:
 
 ```bash
-wget -qO- "http://127.0.0.1:6000/get_channel/1001737065444?id=1&timestamp=1" | jq .
+wget -qO- "http://127.0.0.1:6000/get_channel/1001737065444?limit=250&id=1&timestamp=1" | jq .
 ```
 
 Extra fields:
