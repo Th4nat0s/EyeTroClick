@@ -11,6 +11,16 @@ from contextlib import contextmanager
 MICROSECONDS_PER_DAY = 86_400_000_000
 
 
+def resolve_manifest_path(configured_path, config_directory):
+    """Resolve a configured manifest file relative to the configuration file."""
+    path = str(configured_path or "replication.sqlite3").strip()
+    if not path:
+        path = "replication.sqlite3"
+    if not os.path.isabs(path):
+        path = os.path.join(config_directory, path)
+    return os.path.abspath(path)
+
+
 class ManifestCursorExpired(Exception):
     """Raised when a consumer cursor predates retained manifest rows."""
 

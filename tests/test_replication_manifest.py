@@ -15,6 +15,7 @@ from replication_manifest import (
     deterministic_batch_id,
     group_commit_ranges,
     normalize_batch_id,
+    resolve_manifest_path,
 )
 
 
@@ -25,6 +26,29 @@ def _record(msg_id, chat_id):
 
 class ManifestHelperTests(unittest.TestCase):
     """Validate deterministic IDs and range grouping."""
+
+    def test_manifest_path_is_relative_to_configuration(self):
+        """Relative manifest paths must not depend on the process directory."""
+        self.assertEqual(
+            resolve_manifest_path("state/manifest.sqlite3", "/srv/eyetroclick"),
+            "/srv/eyetroclick/state/manifest.sqlite3",
+        )
+
+    def test_manifest_path_defaults_next_to_configuration(self):
+        """An omitted setting must use a writable application-local default."""
+        self.assertEqual(
+            resolve_manifest_path(None, "/srv/eyetroclick"),
+            "/srv/eyetroclick/replication.sqlite3",
+        )
+
+    def test_absolute_manifest_path_is_preserved(self):
+        """Production deployments can select an absolute persistent path."""
+        self.assertEqual(
+            resolve_manifest_path(
+                "/var/lib/eyetroclick/replication.sqlite3", "/srv/eyetroclick"
+            ),
+            "/var/lib/eyetroclick/replication.sqlite3",
+        )
 
     def test_batch_id_is_order_independent(self):
         """Record ordering must not alter the deterministic retry key."""

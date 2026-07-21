@@ -37,6 +37,7 @@ from replication_manifest import (
     decode_insert_payload,
     group_commit_ranges,
     normalize_batch_id,
+    resolve_manifest_path,
 )
 
 try:
@@ -60,10 +61,10 @@ clickhouse_port = gn_config.get("clickhouse_port")
 app_port = gn_config.get("app_port")
 database_name = gn_config.get("database_name")
 table_name = gn_config.get("table_name")
-replication_manifest_path = os.environ.get(
-    "REPLICATION_MANIFEST_PATH"
-) or gn_config.get(
-    "replication_manifest_path", "/var/lib/eyetroclick/replication.sqlite3"
+replication_manifest_path = resolve_manifest_path(
+    os.environ.get("REPLICATION_MANIFEST_PATH")
+    or gn_config.get("replication_manifest_path"),
+    THIS_DIR,
 )
 replication_api_key = os.environ.get("REPLICATION_API_KEY") or gn_config.get(
     "replication_api_key", ""

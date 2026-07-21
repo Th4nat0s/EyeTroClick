@@ -46,7 +46,7 @@ Set these values in `gn_config.yaml` or through the documented environment
 override for the secret:
 
 ```yaml
-replication_manifest_path: '/var/lib/eyetroclick/replication.sqlite3'
+replication_manifest_path: './replication.sqlite3'
 replication_api_key: ''
 replication_consumer: 'darktrosync'
 replication_manifest_page_size: 1000
@@ -58,8 +58,11 @@ replication_cleanup_batch_size: 10000
 ```
 
 Use `REPLICATION_API_KEY` instead of storing the internal bearer token in the
-configuration file. The manifest directory must be writable by the EyeTroClick
-service account and must live on persistent storage.
+configuration file. `REPLICATION_MANIFEST_PATH` can override the YAML value.
+Relative manifest paths are resolved from the directory containing
+`gn_config.yaml`; when the setting is omitted, `replication.sqlite3` is created
+there. The manifest directory must be writable by the EyeTroClick service
+account and must live on persistent storage.
 
 SQLite uses WAL mode, full synchronous commits, bounded lock waits, and short
 transactions. Manifest cleanup runs after acknowledgements and removes only

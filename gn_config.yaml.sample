@@ -10,8 +10,9 @@ libretranslate_url: 'http://127.0.0.1:5050'
 libretranslate_api_key: ''
 
 # Internal replication API and durable commit-range manifest.
-# Production deployments should place this file on a persistent volume.
-replication_manifest_path: '/var/lib/eyetroclick/replication.sqlite3'
+# Relative paths are resolved from the directory containing gn_config.yaml.
+# Production deployments should use an absolute path on a persistent volume.
+replication_manifest_path: './replication.sqlite3'
 # Prefer the REPLICATION_API_KEY environment variable in production.
 replication_api_key: ''
 replication_consumer: 'darktrosync'
