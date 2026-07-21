@@ -8,3 +8,16 @@ api_key: 'zoubida'
 tagch: 'http://127.0.0.1:5000/mediasview/api_upd_tmedia'
 libretranslate_url: 'http://127.0.0.1:5050'
 libretranslate_api_key: ''
+
+# Internal replication API and durable commit-range manifest.
+# Production deployments should place this file on a persistent volume.
+replication_manifest_path: '/var/lib/eyetroclick/replication.sqlite3'
+# Prefer the REPLICATION_API_KEY environment variable in production.
+replication_api_key: ''
+replication_consumer: 'darktrosync'
+replication_manifest_page_size: 1000
+replication_export_page_size: 10000
+replication_max_ranges: 100
+replication_query_timeout_seconds: 30
+replication_retention_days: 90
+replication_cleanup_batch_size: 10000

@@ -26,8 +26,22 @@ import yaml
 from flask import Flask, request, jsonify, Response
 from clickhouse_driver import Client
 
+from replication_api import (
+    ReplicationApiConfig,
+    ReplicationQueryConfig,
+    ReplicationQueryService,
+    create_replication_blueprint,
+)
+from replication_manifest import (
+    ManifestStore,
+    decode_insert_payload,
+    group_commit_ranges,
+    normalize_batch_id,
+)
+
 try:
     from libretranslatepy import LibreTranslateAPI
+
     LIBRETRANSLATE_IMPORT_ERROR = None
 except Exception as exc:
     LibreTranslateAPI = None
@@ -46,6 +60,27 @@ clickhouse_port = gn_config.get("clickhouse_port")
 app_port = gn_config.get("app_port")
 database_name = gn_config.get("database_name")
 table_name = gn_config.get("table_name")
+replication_manifest_path = os.environ.get(
+    "REPLICATION_MANIFEST_PATH"
+) or gn_config.get(
+    "replication_manifest_path", "/var/lib/eyetroclick/replication.sqlite3"
+)
+replication_api_key = os.environ.get("REPLICATION_API_KEY") or gn_config.get(
+    "replication_api_key", ""
+)
+replication_consumer = gn_config.get("replication_consumer", "darktrosync")
+replication_manifest_page_size = int(
+    gn_config.get("replication_manifest_page_size", 1000)
+)
+replication_export_page_size = int(gn_config.get("replication_export_page_size", 10000))
+replication_max_ranges = int(gn_config.get("replication_max_ranges", 100))
+replication_query_timeout_seconds = int(
+    gn_config.get("replication_query_timeout_seconds", 30)
+)
+replication_retention_days = int(gn_config.get("replication_retention_days", 90))
+replication_cleanup_batch_size = int(
+    gn_config.get("replication_cleanup_batch_size", 10000)
+)
 DEFAULT_LIBRETRANSLATE_URL = "http://127.0.0.1:5050"
 libretranslate_url = (
     os.environ.get("LIBRETRANSLATE_URL")
@@ -226,6 +261,52 @@ def ensure_table_metadata(force=False):
 
 
 refresh_table_metadata()
+
+
+def replication_table_metadata():
+    """Return current message-table metadata for replication queries."""
+    ensure_table_metadata()
+    return {
+        "date_column": DATE_COLUMN,
+        "insert_date_column": INSERT_DATE_COLUMN,
+        "columns": set(table_columns),
+    }
+
+
+def replication_clickhouse_client():
+    """Create a ClickHouse connection for one replication query."""
+    return Client(host=clickhouse_host, port=clickhouse_port)
+
+
+replication_manifest = ManifestStore(replication_manifest_path)
+replication_manifest.initialize()
+replication_query_service = ReplicationQueryService(
+    client_factory=replication_clickhouse_client,
+    metadata_provider=replication_table_metadata,
+    config=ReplicationQueryConfig(
+        database_name=database_name,
+        table_name=table_name,
+        max_export_page=replication_export_page_size,
+        max_ranges=replication_max_ranges,
+        query_timeout_seconds=replication_query_timeout_seconds,
+    ),
+)
+replication_api_config = ReplicationApiConfig(
+    api_key=replication_api_key,
+    consumer=replication_consumer,
+    max_manifest_page=replication_manifest_page_size,
+    max_export_page=replication_export_page_size,
+    max_ranges=replication_max_ranges,
+    retention_days=replication_retention_days,
+    cleanup_batch_size=replication_cleanup_batch_size,
+)
+app.register_blueprint(
+    create_replication_blueprint(
+        replication_manifest,
+        replication_query_service,
+        replication_api_config,
+    )
+)
 
 
 @app.before_request
@@ -2083,34 +2164,64 @@ def last():
 
 @app.route("/insert_records", methods=["POST"])
 def insert_records():
-    """
-    # Collect messages to integrate into the database.
-    """
+    """Insert one durable message batch and record its committed ranges."""
+    try:
+        payload = decode_insert_payload(request.get_json(silent=True))
+        raw_records = payload.get("records")
+        if not isinstance(raw_records, list) or not raw_records:
+            raise ValueError("No records found in the JSON data")
+        batch_id = normalize_batch_id(payload.get("batch_id"), raw_records)
+        commit_ranges = group_commit_ranges(raw_records)
+        records = [convert_record(record) for record in raw_records]
+    except (TypeError, ValueError) as error:
+        return jsonify({"error": str(error)}), 400
 
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "Invalid or missing JSON data"}), 400
-
-    records = json.loads(data).get("records")
-
-    if not records:
-        return jsonify({"error": "No records found in the JSON data"}), 400
-
-    # Conversion des champs datetime pour chaque record
-    records = [convert_record(record) for record in records]
-
-    # Connect to clickhouse
     client = Client(host=clickhouse_host, port=clickhouse_port)
-
     try:
         client.execute(f"INSERT INTO {database_name}.{table_name} VALUES", records)
-        logger.info(f"Inserted {len(records)} records into ClickHouse")
-        return jsonify({"status": "success", "inserted_records": len(records)}), 200
-    except Exception as e:
-        logger.error("Failed to insert records: %s", e)
-        return jsonify({"status": "error", "message": str(e)}), 500
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        logger.exception("ClickHouse insert failed for batch %s", batch_id)
+        return jsonify({"status": "error", "message": str(error)}), 500
     finally:
-        del client
+        disconnect = getattr(client, "disconnect", None)
+        if callable(disconnect):
+            disconnect()
+
+    try:
+        committed = replication_manifest.record_batch(batch_id, commit_ranges)
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.exception(
+            "Manifest commit failed after ClickHouse accepted batch %s; retry required",
+            batch_id,
+        )
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "ClickHouse accepted the batch but manifest commit failed; retry",
+                    "batch_id": batch_id,
+                }
+            ),
+            500,
+        )
+
+    logger.info(
+        "Inserted %d records in batch %s with %d committed channel ranges",
+        len(records),
+        batch_id,
+        len(committed),
+    )
+    return (
+        jsonify(
+            {
+                "status": "success",
+                "inserted_records": len(records),
+                "batch_id": batch_id,
+                "commits": committed,
+            }
+        ),
+        200,
+    )
 
 
 @app.route("/graph", methods=["GET"])
