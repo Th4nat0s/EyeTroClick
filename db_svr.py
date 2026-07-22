@@ -1783,6 +1783,19 @@ def getchatrandoms(count):
 
 
 # Routes pour les stats
+def _channel_monthly_stats_query(chat_id):
+    """Build all-time published-month statistics query for one channel."""
+    return f"""
+        SELECT toStartOfMonth({DATE_COLUMN}) AS month,
+               formatDateTime(toStartOfMonth({DATE_COLUMN}), '%%Y/%%m') AS month_formatted,
+               count(*) AS count
+        FROM {database_name}.{table_name}
+        WHERE chat_id = {chat_id}
+        GROUP BY month
+        ORDER BY month DESC
+    """
+
+
 @app.route("/get_stats_chan", methods=["GET"])
 def get_stats_chan():
     """
@@ -1881,11 +1894,8 @@ def get_stats_chan():
 
     fresult["hourly"] = filled_data
 
-    # Get the count of inserted document by all months
-    query = f"SELECT toStartOfMonth({DATE_COLUMN}) as month, formatDateTime(toStartOfMonth({DATE_COLUMN}), '%%Y/%%m') as month_formatted, count(*) as count FROM \
-              {database_name}.{table_name} WHERE {DATE_COLUMN} >= subtractMonths(now(), 24) and chat_id = {chat_id} \
-              GROUP BY month ORDER BY month DESC"
-    result = client.execute(query, {})
+    # Monthly statistics cover all retained messages, using published date.
+    result = client.execute(_channel_monthly_stats_query(chat_id), {})
     fresult["monthly"] = result
 
     del client

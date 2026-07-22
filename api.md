@@ -372,7 +372,10 @@ target=<target lang>
 
 ## GET /get_stats_chan
 
-Return channel statistics.
+Return channel statistics. `monthly` contains all retained messages grouped by
+their published `date`, ordered newest month first. `daily` covers the latest
+31 days and `hourly` covers the latest 24 hours; both are zero-filled when no
+messages exist in those windows. `insert_date` is not used for these series.
 
 Parameter:
 
