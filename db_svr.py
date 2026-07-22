@@ -13,6 +13,7 @@ import time
 import os
 import logging
 import hashlib
+import hmac
 import json
 import sqlite3
 from datetime import datetime, timedelta, date, timezone
@@ -68,6 +69,9 @@ replication_manifest_path = resolve_manifest_path(
 )
 replication_api_key = os.environ.get("REPLICATION_API_KEY") or gn_config.get(
     "replication_api_key", ""
+)
+metadata_sync_api_key = os.environ.get("METADATA_SYNC_API_KEY") or gn_config.get(
+    "metadata_sync_api_key", ""
 )
 replication_consumer = gn_config.get("replication_consumer", "darktrosync")
 replication_manifest_page_size = int(
@@ -1560,6 +1564,54 @@ def get_msg():
     finally:
         if client:
             client.disconnect()
+
+
+@app.route("/sync_missing_metadata", methods=["POST"])
+def sync_missing_metadata():
+    """Repair bounded Telegram channel message boundaries in Eyetroduit."""
+    from sync_last_ids import (
+        fetch_last_ids_for_ids,
+        push_last_ids,
+        resolve_message_date_column,
+    )
+
+    data = request.get_json(silent=True) or {}
+    supplied_key = request.headers.get("X-API-Key") or data.get("api_key", "")
+    if not metadata_sync_api_key or not hmac.compare_digest(
+        str(supplied_key), metadata_sync_api_key
+    ):
+        return jsonify({"error": "Invalid or missing API key"}), 403
+
+    telegram_ids = data.get("telegram_ids")
+    if (
+        not isinstance(telegram_ids, list)
+        or not telegram_ids
+        or len(telegram_ids) > 1000
+    ):
+        return jsonify({"error": "Invalid telegram_ids"}), 400
+    try:
+        telegram_ids = sorted({abs(int(value)) for value in telegram_ids})
+    except (TypeError, ValueError, OverflowError):
+        return jsonify({"error": "Invalid telegram_ids"}), 400
+    if not telegram_ids or any(value < 1 for value in telegram_ids):
+        return jsonify({"error": "Invalid telegram_ids"}), 400
+
+    config = {
+        "clickhouse_host": clickhouse_host,
+        "clickhouse_port": clickhouse_port,
+        "database_name": database_name,
+        "table_name": table_name,
+        "api_key": gn_config.get("api_key", ""),
+        "tagch": gn_config.get("tagch", ""),
+    }
+    try:
+        date_column = resolve_message_date_column(config)
+        rows = fetch_last_ids_for_ids(config, date_column, telegram_ids)
+        updated, failed = push_last_ids(config, rows)
+    except Exception as error:  # pylint: disable=broad-except
+        app.logger.exception("Metadata synchronization failed: %s", error)
+        return jsonify({"error": "Metadata synchronization failed"}), 502
+    return jsonify({"updated": updated, "failed": failed, "requested": len(telegram_ids)})
 
 
 @app.route("/get_channel/<int:channel_id>", methods=["GET"])

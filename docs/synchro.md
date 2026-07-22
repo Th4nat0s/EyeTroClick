@@ -22,6 +22,15 @@ Useful options:
 --dry-run          print payloads without HTTP updates
 ```
 
+## Daily missing-boundary repair
+
+eYeTr0du1t may call `POST /sync_missing_metadata` from its frequent database
+maintenance job. The endpoint accepts a bounded `telegram_ids` list, reads
+first/last message boundaries from ClickHouse, and updates the configured
+eYeTr0du1t `tagch` endpoint. Protect it with `metadata_sync_api_key` (or the
+`METADATA_SYNC_API_KEY` environment variable). Reads are safe alongside
+ClickHouse inserts; callers should avoid overlapping repair requests.
+
 The job paginates by ascending absolute Telegram channel ID. Each payload
 contains `telegram_id`, `first_msg`, `last_id`, `last_msg`, `first_blood`, and
 `touch_last_seen`. Non-200 responses count as failures; exit status `2` means

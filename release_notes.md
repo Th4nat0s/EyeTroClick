@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add targeted ClickHouse metadata-boundary repair for eYeTr0du1t daily maintenance.
+
 - Include all retained published message history in channel monthly statistics.
 - Keep message IDs and timestamps available to Eyetroduit channel message views.
 - Add a WAL-backed SQLite manifest for committed channel message ranges.

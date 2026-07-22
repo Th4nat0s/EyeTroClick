@@ -156,6 +156,44 @@ def fetch_last_ids_batch(
     ]
 
 
+def fetch_last_ids_for_ids(
+    config: Dict[str, object], date_column: str, telegram_ids: List[int]
+) -> List[Dict[str, object]]:
+    """Fetch message boundaries for a bounded list of Telegram IDs."""
+    if not telegram_ids:
+        return []
+    client = Client(host=config["clickhouse_host"], port=config["clickhouse_port"])
+    query = f"""
+        SELECT
+            abs(chat_id) AS telegram_id,
+            argMax(chat_name, msg_id) AS chat_name,
+            min(msg_id) AS first_id,
+            argMin({date_column}, msg_id) AS first_msg,
+            max(msg_id) AS last_id,
+            argMax({date_column}, msg_id) AS last_msg
+        FROM {config["database_name"]}.{config["table_name"]}
+        WHERE abs(chat_id) IN %(telegram_ids)s
+        GROUP BY telegram_id
+        ORDER BY telegram_id
+    """
+    try:
+        rows = client.execute(query, {"telegram_ids": tuple(telegram_ids)})
+    finally:
+        client.disconnect()
+    return [
+        {
+            "telegram_id": int(row[0]),
+            "chat_name": row[1] or "",
+            "first_id": int(row[2]),
+            "first_msg": format_backend_datetime(row[3]),
+            "last_id": int(row[4]),
+            "last_msg": format_backend_datetime(row[5]),
+        }
+        for row in rows
+        if all(value is not None for value in (row[0], row[2], row[3], row[4], row[5]))
+    ]
+
+
 def fetch_last_ids(
     config: Dict[str, object],
     date_column: str,
