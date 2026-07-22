@@ -384,6 +384,19 @@ chan_name=<channel name or id>
 
 Return global statistics.
 
+## GET /get_stats/<section>
+
+Return one global-statistics section without executing unrelated queries.
+
+Supported sections:
+
+- `summary`: total messages and distinct channels.
+- `collected`: acquired daily, hourly, and monthly series.
+- `published`: published daily, hourly, and monthly series.
+- `database`: top 50 channels and database field statistics.
+
+The aggregate `/get_stats` endpoint remains available for compatibility.
+
 ## GET /user_brief
 
 Return short user activity summary.

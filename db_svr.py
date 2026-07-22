@@ -1886,6 +1886,100 @@ def get_stats_chan():
 
 
 # Routes pour les stats
+def _stats_section(section):
+    """Return one bounded global-statistics section."""
+    client = Client(host=clickhouse_host, port=clickhouse_port)
+    result = {}
+    if section == "summary":
+        result["chats"] = client.execute(
+            f"SELECT countDistinct(chat_id) FROM {database_name}.{table_name}", {}
+        )[0]
+        result["msgs"] = client.execute(
+            f"SELECT count(msg_id) FROM {database_name}.{table_name}", {}
+        )[0]
+    elif section == "collected":
+        result["cdaily"] = client.execute(
+            f"SELECT toDate({INSERT_DATE_COLUMN}) AS actual_date, "
+            f"formatDateTime(toDate({INSERT_DATE_COLUMN}), '%%d/%%m') AS day_formatted, "
+            f"count(*) AS count FROM {database_name}.{table_name} "
+            f"WHERE {INSERT_DATE_COLUMN} >= toStartOfDay(subtractDays(now(), 31)) "
+            f"GROUP BY actual_date ORDER BY actual_date DESC",
+            {},
+        )
+        result["chourly"] = client.execute(
+            f"SELECT toStartOfHour({INSERT_DATE_COLUMN}) AS actual_hour, "
+            f"formatDateTime(toStartOfHour({INSERT_DATE_COLUMN}), '%%H:00') AS hour_formatted, "
+            f"count(*) AS count FROM {database_name}.{table_name} "
+            f"WHERE {INSERT_DATE_COLUMN} >= subtractHours(now(), 24) "
+            f"GROUP BY actual_hour ORDER BY actual_hour DESC",
+            {},
+        )
+        result["cmonthly"] = client.execute(
+            f"SELECT toStartOfMonth({INSERT_DATE_COLUMN}) AS month, "
+            f"formatDateTime(toStartOfMonth({INSERT_DATE_COLUMN}), '%%Y/%%m') AS month_formatted, "
+            f"count(*) AS count FROM {database_name}.{table_name} "
+            f"WHERE {INSERT_DATE_COLUMN} >= subtractMonths(now(), 24) "
+            f"GROUP BY month ORDER BY month DESC LIMIT 24",
+            {},
+        )
+    elif section == "published":
+        result["daily"] = client.execute(
+            f"SELECT toDate({DATE_COLUMN}) AS actual_date, "
+            f"formatDateTime(toDate({DATE_COLUMN}), '%%d/%%m') AS day_formatted, "
+            f"count(*) AS count FROM {database_name}.{table_name} "
+            f"WHERE {DATE_COLUMN} >= toStartOfDay(subtractDays(now(), 31)) "
+            f"GROUP BY actual_date ORDER BY actual_date DESC",
+            {},
+        )
+        result["hourly"] = client.execute(
+            f"SELECT toStartOfHour({DATE_COLUMN}) AS actual_hour, "
+            f"formatDateTime(toStartOfHour({DATE_COLUMN}), '%%H:00') AS hour_formatted, "
+            f"count(*) AS count FROM {database_name}.{table_name} "
+            f"WHERE {DATE_COLUMN} >= subtractHours(now(), 24) "
+            f"GROUP BY actual_hour ORDER BY actual_hour DESC",
+            {},
+        )
+        result["monthly"] = client.execute(
+            f"SELECT toStartOfMonth({DATE_COLUMN}) AS month, "
+            f"formatDateTime(toStartOfMonth({DATE_COLUMN}), '%%Y/%%m') AS month_formatted, "
+            f"count(*) AS count FROM {database_name}.{table_name} "
+            f"WHERE {DATE_COLUMN} >= subtractMonths(now(), 24) "
+            f"GROUP BY month ORDER BY month DESC LIMIT 24",
+            {},
+        )
+    elif section == "database":
+        result["top50"] = client.execute(
+            f"SELECT chat_id, chat_name, COUNT(msg_id) AS msg_count "
+            f"FROM {database_name}.{table_name} GROUP BY chat_id, chat_name "
+            f"ORDER BY msg_count DESC LIMIT 50",
+            {},
+        )
+        result["stats"] = client.execute(
+            "SELECT name, formatReadableSize(sum(data_compressed_bytes)), "
+            "formatReadableSize(sum(data_uncompressed_bytes)), "
+            "round(sum(data_uncompressed_bytes) / sum(data_compressed_bytes), 2) "
+            "FROM system.columns WHERE table = 'msg' GROUP BY name",
+            {},
+        )
+    else:
+        client.disconnect()
+        raise ValueError(f"Unknown statistics section: {section}")
+    client.disconnect()
+    return result
+
+
+@app.route("/get_stats/<section>", methods=["GET"])
+def get_stats_section(section):
+    """Return one global-statistics section without running other queries."""
+    try:
+        return jsonify(_stats_section(section.lower()))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        logger.warning("Statistics section failed: %s", exc)
+        return jsonify({"error": "statistics section unavailable"}), 502
+
+
 @app.route("/get_stats", methods=["GET"])
 def get_stats():
     """
