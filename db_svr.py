@@ -122,6 +122,11 @@ valid_fields = [
     "hashtags",
 ]
 
+MESSAGE_RESULT_FIELDS = [
+    "id",
+    *valid_fields[1:],
+]
+
 table_columns = set()
 DATE_COLUMN = "date"
 INSERT_DATE_COLUMN = "insert_date"
@@ -133,6 +138,11 @@ METADATA_REFRESH_INTERVAL = 60
 _earliest_date = None
 FORCE_EXACT_FIELDS = {"chat_id", "username_sender_exact"}
 FORCE_INTEGER_FIELDS = {"chat_id", "username_sender_exact"}
+
+
+def message_rows_to_dicts(rows):
+    """Map ClickHouse message rows to the stable API message schema."""
+    return [dict(zip(MESSAGE_RESULT_FIELDS, row)) for row in rows]
 
 
 def _normalize_iso_datetime(value: str) -> str:
@@ -227,7 +237,7 @@ def refresh_table_metadata():
         "chatname": "chat_name",
     }
     queryable_fields = set(valid_fields) | set(field_aliases.keys())
-    star_clause = f""" msg_id,
+    star_clause = f""" msg_id AS id,
         chat_id,
         chat_name,
         username,
@@ -400,8 +410,7 @@ def _execute_search_once(
 
     try:
         result = client.execute(query, params)
-        column_names = valid_fields
-        results_dict = [dict(zip(column_names, row)) for row in result]
+        results_dict = message_rows_to_dicts(result)
         len_result = len(result)
         limit_reached = len_result >= query_limit
 
@@ -1466,8 +1475,7 @@ def search_channel_text():
 
     try:
         result = client.execute(query, params)
-        column_names = valid_fields
-        results_dict = [dict(zip(column_names, row)) for row in result]
+        results_dict = message_rows_to_dicts(result)
         len_result = len(result)
 
         if len_result >= local_count:
@@ -1541,8 +1549,7 @@ def get_msg():
             LIMIT 1
         """
         result = client.execute(query, {"msg_id": int(msg_id), "chat_id": int(chat_id)})
-        column_names = valid_fields  # Make sure this matches the SELECT columns order
-        results_dict = [dict(zip(column_names, row)) for row in result]
+        results_dict = message_rows_to_dicts(result)
 
         return jsonify(results_dict)
 
@@ -1638,7 +1645,7 @@ def get_channel(channel_id):
     id_fields = {"id", "chat_id", "sender_chat_id", "msg_fwd_id"}
     timestamp_fields = {"date", "insert_date"}
     for item in messages_result:
-        message = dict(zip(valid_fields, item))
+        message = message_rows_to_dicts([item])[0]
         if not include_ids:
             for field in id_fields:
                 message.pop(field, None)
@@ -2206,8 +2213,7 @@ def last():
                 break
 
             # Préparer les résultats
-            column_names = valid_fields
-            results_dict = [dict(zip(column_names, row)) for row in result]
+            results_dict = message_rows_to_dicts(result)
             out_dict = []
 
             for msg in results_dict:

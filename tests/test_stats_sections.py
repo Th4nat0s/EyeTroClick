@@ -12,6 +12,11 @@ FUNCTION = next(
     for node in TREE.body
     if isinstance(node, ast.FunctionDef) and node.name == "_stats_section"
 )
+MESSAGE_HELPER = next(
+    node
+    for node in TREE.body
+    if isinstance(node, ast.FunctionDef) and node.name == "message_rows_to_dicts"
+)
 
 
 class FakeClient:
@@ -68,6 +73,42 @@ class StatsSectionsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.stats_section("unknown")
         self.assertEqual(self.client.queries, [])
+
+    def test_message_rows_keep_id_and_timestamps(self):
+        """Search responses expose fields required by the channel message view."""
+        namespace = {
+            "MESSAGE_RESULT_FIELDS": [
+                "id",
+                "chat_id",
+                "date",
+                "insert_date",
+                "text",
+            ]
+        }
+        exec(
+            compile(
+                ast.Module(body=[MESSAGE_HELPER], type_ignores=[]),
+                "db_svr.py",
+                "exec",
+            ),
+            namespace,
+        )
+
+        result = namespace["message_rows_to_dicts"](
+            [
+                (
+                    192,
+                    1001385580796,
+                    "2022-04-05T22:01:56+00:00",
+                    "2025-02-06T23:08:19+00:00",
+                    "text",
+                )
+            ]
+        )
+
+        self.assertEqual(result[0]["id"], 192)
+        self.assertEqual(result[0]["date"], "2022-04-05T22:01:56+00:00")
+        self.assertEqual(result[0]["insert_date"], "2025-02-06T23:08:19+00:00")
 
 
 if __name__ == "__main__":

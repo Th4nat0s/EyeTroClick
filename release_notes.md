@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Keep message IDs and timestamps available to Eyetroduit channel message views.
 - Add a WAL-backed SQLite manifest for committed channel message ranges.
 - Add authenticated, bounded full and incremental replication export APIs.
 - Preserve legacy bulk insert payloads while adding idempotent batch identities.
