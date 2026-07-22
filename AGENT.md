@@ -4,7 +4,7 @@
 
 `EyeTroClick` is the authoritative ClickHouse backend for Telegram messages
 collected by the EyeTro ecosystem. It exposes Flask APIs for insertion, search,
-analysis, translation, and bounded replication.
+analysis, translation, statistics, and channel synchronization.
 
 Companion repositories:
 
@@ -22,6 +22,8 @@ Canonical Telegram channel IDs stored in ClickHouse are positive integers.
 - `replication_api.py`: authenticated full and incremental replication exports.
 - `sync_last_ids.py`: synchronization of channel message watermarks.
 - `gn_config.yaml.sample`: runtime configuration reference.
+- `docs/stats.md`: statistics routes and timestamp semantics.
+- `docs/synchro.md`: synchronization routes and `sync_last_ids.py` usage.
 - `tests/`: unit and integration tests using fake ClickHouse clients.
 
 ## Replication Invariants
