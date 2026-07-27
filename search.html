@@ -1,0 +1,208 @@
+{% extends "appbuilder/base.html" %}
+{% import 'appbuilder/general/lib.html' as lib %}
+{% block content %}
+{{ lib.panel_begin(title) }}
+
+<style>
+.btn-white {
+    color: white; /* Change la couleur du texte en blanc */
+    background-color: #007bff; /* Optionnel : ajoute une couleur de fond */
+}
+</style>
+
+<style>
+  .centered{
+    width:400px;
+    height:400px;
+    position:absolute;
+    top:70%;
+    left:50%;
+    transform:translate(-50%,-50%);
+    background:transparent;
+    filter: blur(1px) contrast(2);
+  }
+  .blob-1,.blob-2{
+    width:20px;
+    height:20px;
+    position:absolute;
+    background:#fff;
+    border-radius:1%;
+    top:5%;left:5%;
+    transform:translate(-5%,-5%);
+  }
+  .blob-1{
+    left:20%;
+    animation:osc-l 2.5s ease infinite;
+  }
+  .blob-2{
+    left:80%;
+    animation:osc-r 2.5s ease infinite;
+    background:#0ff;
+  }
+  @keyframes osc-l{
+    0%{left:20%;}
+    50%{left:50%;}
+    100%{left:20%;}
+  }
+  @keyframes osc-r{
+    0%{left:80%;}
+    50%{left:50%;}
+    100%{left:80%;}
+  }</style>
+
+
+<h1>Snoop into {{data.count}} Telegram messages</h1>
+
+<div class="container col-md-12">
+  <form id="searchForm" class="col-md-12" >
+  <div class="form-row">
+    <div class="form-group col-md-6">
+      <label for="field">Champ:</label>
+      <select id="field" name="field" required>
+        <option value="text">Message</option>
+        <option value="chat_name">Chat Name</option>
+        <option value="chat_id">Chat ID</option>
+        <option value="hashtags">HashTags</option>
+        <option value="urls">Url</option>
+        <option value="document_name">Document</option>
+      </select>
+    </div>
+    <div class="form-group col-md-6">
+      <label for="method">Méthode:</label>
+      <select id="method" name="method" required>
+        <option value="LIKE">Contains</option>
+        <option value="ILIKE">Insensitive Contains</option>
+        <option value="IS">Exact</option>
+      </select>
+    </div>
+  </div> 
+  <div class="form-row">
+    <div class="form-group col-md-10">
+      <input type="text" id="value" name="value" class="form-control" required>
+    </div>
+    <div class="form-group col-md-1">
+      <button type="submit" class="btn-white" >Rechercher</button>
+    </div>
+  </div>
+  <br><br>
+  <div class="form-row">
+    <div class="form-group col-md-10">
+      <label for="count">Nombre de réponses (max 1000)&nbsp;</label>
+      <input type="number" id="count" name="count" value="100">
+    </div>
+  </div>
+  </form>
+</div>
+
+
+<div id="loading" class="text-center hidden">
+  <div>Loading...</div>
+  <div class = "centered">
+    <div class = "blob-1"></div>
+    <div class = "blob-2"></div>
+  </div>
+</div>
+
+<div id="results"></div> 
+  <script>
+function escapeHtml(text) {
+    var map = {
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#039;',
+        '/': '&#x2F;',
+        '`': '&#x60;',
+        '=': '&#x3D;'
+    };
+    return text.replace(/[&<>"'`=/]/g, function(m) { return map[m]; });
+}
+        $(document).ready(function() {
+            // Récupérer l'URL de la route Flask pour les requêtes POST
+            var searchUrl = "../search_go_telegrams";
+            // Gérer la soumission du formulaire
+            $('#searchForm').on('submit', function(event) {
+                event.preventDefault();
+
+                var formData = {
+                    field: $('#field').val(),
+                    value: $('#value').val(),
+                    method: $('#method').val(),
+                    count: $('#count').val()
+                };
+                $("#loading").removeClass("hidden");
+                $('#results').html('');
+                    // Envoyer une requête POST avec AJAX senteur fleurs
+                $.ajax({
+                    url: searchUrl,
+                    type: 'POST',
+                    contentType: 'application/json',
+                    data: JSON.stringify(formData),
+                    success: function(response) {
+                       $('#results').empty();
+
+                            $("#loading").addClass("hidden");
+                        if (response.results.length > 0) {                                
+                            $('#results').append(`${response.results.length} Results in `);
+                            $('#results').append(response.timing);
+                            $('#results').append('Sec');
+                            if (response.has_more == "True") {
+                            $('#results').append(' but more results in database');
+                            };
+                            response.results.forEach(function(result) {
+                                var formattedText = escapeHtml(result.text).replace(/\n/g, '<br>');
+                                var resultHtml = `
+                                      <div class="container col-md-12">
+                                      <div class="card text-white bg-primary col-md-12">
+                                      <div class="card-header"><h3>Channel:
+                                            ${result.chat_id}::${result.chat_name} Msg:${result.id} 
+                                            <a class="alert-link" target="_blank" href="https://t.me/${result.chat_name}/${result.id}">
+                                            <i style="color:white" class="fab fa-telegram"></i></a>
+                                            <a class="alert-link" href="../../telegramview/get_telegram/${result.chat_id}-${result.id}">
+                                            <i style="color:white" class="fas fa-download"></i></a></h3>
+                                      </div><br>
+                                            <p class="card-text">On <strong>${new Date(result.date).toISOString().replace('T',' ').replace('.000Z', ' UTC')}
+                                            </strong> aquired on ${new Date(result.insert_date).toISOString().replace('T',' ').replace('.000Z', ' UTC')}<br>
+                                            Detected language: <strong>${result.lang}</strong><p>
+                                            <p class="card-text"><strong>${result.username}</strong> (${result.sender_chat_id}) wrote</p><br>
+                                            <p class="card-text"><strong>${result.title}</strong></p>
+                                            <p class="card-text">${formattedText}</p>`;
+																if ( result.msg_fwd == 1) {
+                                          resultHtml = resultHtml + `
+                                            <p class="card-text"><strong>Forwarded from</strong>
+                                            ${result.msg_fwd_title}
+                                            ${result.msg_fwd_id}
+                                            by ${result.msg_fwd_username}</p>`;
+
+                                  };
+																if ( result.document_present == 1) {
+																				resultHtml = resultHtml + `<p class="card-text"><strong><i class="fa-regular fa-file"></i></strong> ${result.document_name}&nbsp;
+                                            ${result.document_size} Bytes (${result.document_type})</p>`;
+																}; 
+                                resultHtml = resultHtml + `
+                                        <p class="card-text"><strong>${result.hashtags}</strong></p>
+                                        </div></div><div>&nbsp;</div>`;
+                                $('#results').append(resultHtml);
+
+                            });
+      } else {
+                            $('#results').html('<p>Aucun résultat trouvé. </p>');
+                            $('#results').append(response.timing);
+                            $('#results').append(' Sec');
+                        }
+                    },
+                    error: function(error) {
+                        $('#results').html('<p>Une erreur s\'est produite.</p>');
+                    }
+                });
+            });
+        });
+  </script>
+
+{% endblock %}
+{% block tail_js %}
+{{ super() }}
+<script src="{{url_for('static',filename='js/additionnal.js')}}"></script>
+{% endblock %}
+

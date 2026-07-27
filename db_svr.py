@@ -1,24 +1,59 @@
 #!/usr/bin/env python3
 # coding=utf-8
 
-from flask import Flask, request, jsonify, Response
-from clickhouse_driver import Client
-from datetime import datetime, timedelta, date
-from collections import defaultdict
+'''
+    This is the backend DB to EyeTroduit API Interface.
+
+    All of the Call are initiated from the CC
+    Authentication should be performed at IP level
+
+'''
+
 import time
 import os
-import yaml
-import json
 import logging
 import hashlib
-from datetime import timezone
+import hmac
+import json
+import sqlite3
+from datetime import datetime, timedelta, date, timezone
+from collections import defaultdict
 from email.utils import parsedate_to_datetime
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+import yaml
+from flask import Flask, request, jsonify, Response
+from clickhouse_driver import Client
+
+from replication_api import (
+    ReplicationApiConfig,
+    ReplicationQueryConfig,
+    ReplicationQueryService,
+    create_replication_blueprint,
+)
+from replication_manifest import (
+    ManifestStore,
+    decode_insert_payload,
+    group_commit_ranges,
+    normalize_batch_id,
+    resolve_manifest_path,
+)
+
+try:
+    from libretranslatepy import LibreTranslateAPI
+
+    LIBRETRANSLATE_IMPORT_ERROR = None
+except Exception as exc:
+    LibreTranslateAPI = None
+    LIBRETRANSLATE_IMPORT_ERROR = exc
 
 app = Flask(__name__)
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(THIS_DIR, "./gn_config.yaml")) as f:
     gn_config = yaml.safe_load(f)
+APP_DB_PATH = os.path.join(THIS_DIR, "app.db")
 
 # Configuration de la connexion
 # clickhouse_host = 'localhost'
@@ -27,8 +62,45 @@ clickhouse_port = gn_config.get("clickhouse_port")
 app_port = gn_config.get("app_port")
 database_name = gn_config.get("database_name")
 table_name = gn_config.get("table_name")
+replication_manifest_path = resolve_manifest_path(
+    os.environ.get("REPLICATION_MANIFEST_PATH")
+    or gn_config.get("replication_manifest_path"),
+    THIS_DIR,
+)
+replication_api_key = os.environ.get("REPLICATION_API_KEY") or gn_config.get(
+    "replication_api_key", ""
+)
+metadata_sync_api_key = os.environ.get("METADATA_SYNC_API_KEY") or gn_config.get(
+    "metadata_sync_api_key", ""
+)
+replication_consumer = gn_config.get("replication_consumer", "darktrosync")
+replication_manifest_page_size = int(
+    gn_config.get("replication_manifest_page_size", 1000)
+)
+replication_export_page_size = int(gn_config.get("replication_export_page_size", 10000))
+replication_max_ranges = int(gn_config.get("replication_max_ranges", 100))
+replication_query_timeout_seconds = int(
+    gn_config.get("replication_query_timeout_seconds", 30)
+)
+replication_retention_days = int(gn_config.get("replication_retention_days", 90))
+replication_cleanup_batch_size = int(
+    gn_config.get("replication_cleanup_batch_size", 10000)
+)
+DEFAULT_LIBRETRANSLATE_URL = "http://127.0.0.1:5050"
+libretranslate_url = (
+    os.environ.get("LIBRETRANSLATE_URL")
+    or gn_config.get("libretranslate_url")
+    or (
+        LibreTranslateAPI.DEFAULT_URL
+        if LibreTranslateAPI is not None
+        else DEFAULT_LIBRETRANSLATE_URL
+    )
+)
+libretranslate_api_key = (
+    os.environ.get("LIBRETRANSLATE_API_KEY") or gn_config.get("libretranslate_api_key")
+)
 logger = logging.getLogger(__name__)
-
+_logged_libretranslate_fallback = False
 
 # Liste des colonnes valides pour éviter les injections SQL
 valid_fields = [
@@ -54,6 +126,11 @@ valid_fields = [
     "hashtags",
 ]
 
+MESSAGE_RESULT_FIELDS = [
+    "id",
+    *valid_fields[1:],
+]
+
 table_columns = set()
 DATE_COLUMN = "date"
 INSERT_DATE_COLUMN = "insert_date"
@@ -65,6 +142,16 @@ METADATA_REFRESH_INTERVAL = 60
 _earliest_date = None
 FORCE_EXACT_FIELDS = {"chat_id", "username_sender_exact"}
 FORCE_INTEGER_FIELDS = {"chat_id", "username_sender_exact"}
+LAST_DEFAULT_WINDOW_MINUTES = 5
+LAST_MAX_WINDOW_SECONDS = 31 * 24 * 60 * 60
+LAST_DEFAULT_PAGE_SIZE = 50000
+LAST_MAX_PAGE_SIZE = 50000
+LAST_MAX_PAGE = 1000
+
+
+def message_rows_to_dicts(rows):
+    """Map ClickHouse message rows to the stable API message schema."""
+    return [dict(zip(MESSAGE_RESULT_FIELDS, row)) for row in rows]
 
 
 def _normalize_iso_datetime(value: str) -> str:
@@ -159,7 +246,7 @@ def refresh_table_metadata():
         "chatname": "chat_name",
     }
     queryable_fields = set(valid_fields) | set(field_aliases.keys())
-    star_clause = f""" msg_id,
+    star_clause = f""" msg_id AS id,
         chat_id,
         chat_name,
         username,
@@ -194,6 +281,52 @@ def ensure_table_metadata(force=False):
 
 
 refresh_table_metadata()
+
+
+def replication_table_metadata():
+    """Return current message-table metadata for replication queries."""
+    ensure_table_metadata()
+    return {
+        "date_column": DATE_COLUMN,
+        "insert_date_column": INSERT_DATE_COLUMN,
+        "columns": set(table_columns),
+    }
+
+
+def replication_clickhouse_client():
+    """Create a ClickHouse connection for one replication query."""
+    return Client(host=clickhouse_host, port=clickhouse_port)
+
+
+replication_manifest = ManifestStore(replication_manifest_path)
+replication_manifest.initialize()
+replication_query_service = ReplicationQueryService(
+    client_factory=replication_clickhouse_client,
+    metadata_provider=replication_table_metadata,
+    config=ReplicationQueryConfig(
+        database_name=database_name,
+        table_name=table_name,
+        max_export_page=replication_export_page_size,
+        max_ranges=replication_max_ranges,
+        query_timeout_seconds=replication_query_timeout_seconds,
+    ),
+)
+replication_api_config = ReplicationApiConfig(
+    api_key=replication_api_key,
+    consumer=replication_consumer,
+    max_manifest_page=replication_manifest_page_size,
+    max_export_page=replication_export_page_size,
+    max_ranges=replication_max_ranges,
+    retention_days=replication_retention_days,
+    cleanup_batch_size=replication_cleanup_batch_size,
+)
+app.register_blueprint(
+    create_replication_blueprint(
+        replication_manifest,
+        replication_query_service,
+        replication_api_config,
+    )
+)
 
 
 @app.before_request
@@ -286,8 +419,7 @@ def _execute_search_once(
 
     try:
         result = client.execute(query, params)
-        column_names = valid_fields
-        results_dict = [dict(zip(column_names, row)) for row in result]
+        results_dict = message_rows_to_dicts(result)
         len_result = len(result)
         limit_reached = len_result >= query_limit
 
@@ -416,6 +548,9 @@ def perform_search_query(
 
 
 def convert_dates_to_iso(data):
+    '''
+        This function, will convert datetime to utc in isoformat for key date and insest_date in a dict
+    '''
     for item in data:
         for field in ["date", "insert_date"]:
             if field in item and isinstance(item[field], str):
@@ -430,6 +565,9 @@ def convert_dates_to_iso(data):
 
 
 def parse_iso8601_flexible(date_str):
+    """
+    Convert an ISO 8601 string into a python datetime object.
+    """
     if len(date_str) >= 5 and (date_str[-5] in ["+", "-"]) and date_str[-2:].isdigit():
         # Extrait le décalage horaire
         offset = date_str[-5:]
@@ -459,11 +597,96 @@ def serialize_datetime(obj):
 
 
 def valid_integer(value):
+    '''
+    This function check if the integer given in a string is really an integer
+    '''
     try:
         int(value)
         return True
     except ValueError:
         return False
+
+
+def _last_integer_parameter(name, value, default, minimum=0):
+    """Parse one bounded integer query parameter for the recent-message API."""
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if parsed < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return parsed
+
+
+def request_flag_enabled(*names):
+    """Return True when any query flag is present and not false-like."""
+    false_values = {"", "0", "false", "no", "off"}
+    for name in names:
+        if name in request.args:
+            value = request.args.get(name, "1")
+            return str(value).lower() not in false_values
+    return False
+
+
+def disable_channel_for_empty_messages(comm_id):
+    try:
+        with sqlite3.connect(APP_DB_PATH) as conn:
+            conn.execute("UPDATE comms SET last_id = 0 WHERE id = ?", (comm_id,))
+            conn.commit()
+    except sqlite3.Error as exc:
+        logger.warning("Unable to disable empty channel %s: %s", comm_id, exc)
+
+
+def _normalize_language_code(value):
+    if value is None:
+        return None
+    return str(value).strip().lower()
+
+
+def _translate_text(source_lang, target_lang, text):
+    global _logged_libretranslate_fallback
+    if LibreTranslateAPI is not None:
+        translator = LibreTranslateAPI(
+            url=libretranslate_url, api_key=libretranslate_api_key
+        )
+        return translator.translate(text, source_lang, target_lang, timeout=15)
+
+    if LIBRETRANSLATE_IMPORT_ERROR is not None and not _logged_libretranslate_fallback:
+        logger.warning(
+            "libretranslatepy unavailable, falling back to urllib: %s",
+            LIBRETRANSLATE_IMPORT_ERROR,
+        )
+        _logged_libretranslate_fallback = True
+
+    payload = {
+        "q": text,
+        "source": source_lang,
+        "target": target_lang,
+        "format": "text",
+    }
+    if libretranslate_api_key:
+        payload["api_key"] = libretranslate_api_key
+
+    request = Request(
+        libretranslate_url.rstrip("/") + "/translate",
+        data=urlencode(payload).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+
+    with urlopen(request, timeout=15) as response:
+        charset = response.headers.get_content_charset() or "utf-8"
+        body = response.read().decode(charset, errors="replace")
+
+    parsed = json.loads(body)
+    translated_text = parsed.get("translatedText") if isinstance(parsed, dict) else None
+    if translated_text is None:
+        raise ValueError("Unexpected LibreTranslate response")
+    return translated_text
 
 
 @app.route("/", methods=["GET"])
@@ -1014,6 +1237,91 @@ def home():
     return Response(html_page, mimetype="text/html")
 
 
+@app.route("/translate", methods=["GET"])
+def translate_text():
+    """
+    Translate text from LSRC to LDST using LibreTranslate.
+    """
+    source_lang = _normalize_language_code(
+        request.args.get("LSRC") or request.args.get("lsrc")
+    )
+    target_lang = _normalize_language_code(
+        request.args.get("LDST") or request.args.get("ldst")
+    )
+    text = request.args.get("TEXT") or request.args.get("text")
+
+    if not source_lang or not target_lang or text is None:
+        return jsonify({"error": "Missing LSRC, LDST or TEXT parameter"}), 400
+
+    if not str(text).strip():
+        return jsonify({"error": "TEXT parameter cannot be empty"}), 400
+
+    if source_lang == target_lang:
+        return jsonify(
+            {
+                "source": source_lang,
+                "target": target_lang,
+                "original_text": text,
+                "translated_text": text,
+                "provider": "LibreTranslate",
+                "service_url": libretranslate_url,
+            }
+        )
+
+    try:
+        translated_text = _translate_text(source_lang, target_lang, text)
+    except HTTPError as exc:
+        logger.warning("LibreTranslate HTTP error: %s", exc)
+        error_body = None
+        upstream_error = None
+        try:
+            raw_body = exc.read().decode("utf-8", errors="replace")
+            if raw_body:
+                error_body = raw_body
+                parsed_body = json.loads(raw_body)
+                if isinstance(parsed_body, dict):
+                    upstream_error = parsed_body.get("error")
+        except Exception:
+            error_body = None
+
+        payload = {
+            "error": f"LibreTranslate HTTP error: {exc.reason}",
+            "service_url": libretranslate_url,
+        }
+        if upstream_error:
+            payload["upstream_error"] = upstream_error
+        elif error_body:
+            payload["upstream_response"] = error_body
+        return jsonify(payload), exc.code
+    except URLError as exc:
+        logger.warning("LibreTranslate network error: %s", exc)
+        reason = getattr(exc, "reason", str(exc))
+        payload = {
+            "error": f"LibreTranslate network error: {reason}",
+            "service_url": libretranslate_url,
+        }
+        if isinstance(reason, ConnectionRefusedError) or "[Errno 111]" in str(reason):
+            payload["hint"] = (
+                "LibreTranslate is not listening on the configured URL. "
+                "Start ./libretranslate/start_libretranslate.cmd or update libretranslate_url."
+            )
+        return jsonify(payload), 502
+    except Exception as exc:
+        logger.exception("LibreTranslate unexpected error")
+        return jsonify({"error": str(exc)}), 500
+
+    return jsonify(
+        {
+            "source": source_lang,
+            "target": target_lang,
+            "original_text": text,
+            "translated_text": translated_text,
+            "provider": "LibreTranslate",
+            "service_url": libretranslate_url,
+        }
+    )
+
+
 @app.route("/search_go_telegrams", methods=["POST"])
 def search_go_telegrams():
     """
@@ -1104,7 +1412,11 @@ def search_latest():
 # Route pour les requêtes de recherche
 @app.route("/search", methods=["GET"])
 def search():
-
+    """
+    This function is called by the search page on the CC
+    /telegramsearch/search_telegrams/
+    and allows searching into the database.
+    """
     field = request.args.get("field")
     raw_value = request.args.get("value")
     method = request.args.get("method")
@@ -1138,6 +1450,71 @@ def search():
         print(f"error: {exc}")
         return jsonify({"error": str(exc)}), 500
 
+# Route pour la recherche combinée channel + texte
+@app.route("/search_channel_text", methods=["GET"])
+def search_channel_text():
+    """
+    Search text inside a single channel with LIKE/ILIKE on the text field.
+    """
+    start_time = time.time()
+    client = Client(host=clickhouse_host, port=clickhouse_port)
+
+    chat_id = request.args.get("chat_id")
+    text = request.args.get("text")
+    method = request.args.get("method", "ILIKE")
+    local_count = request.args.get("count")
+
+    if not chat_id or not text:
+        return jsonify({"error": "Missing chat_id or text parameter"}), 400
+
+    if not valid_integer(chat_id):
+        return jsonify({"error": "Invalid chat_id"}), 400
+
+    try:
+        local_count = int(local_count) if local_count else 100
+        if local_count > 50:
+            return jsonify({"error": "Count exceeds limits"}), 400
+    except ValueError:
+        return jsonify({"error": "Invalid Count"}), 400
+
+    method = method.lower()
+    if method not in ("like", "ilike"):
+        return jsonify({"error": "Invalid method parameter"}), 400
+
+    if method == 'like':
+        query = f"""SELECT {star}
+                    FROM {database_name}.{table_name}
+                    WHERE chat_id = %(chat_id)s AND text LIKE %(value)s
+                    order by {DATE_COLUMN} desc limit {local_count}"""
+        params = {"chat_id": int(chat_id), "value": f"%{text}%"}
+    else:
+        query = f"""SELECT {star}
+                    FROM {database_name}.{table_name}
+                    WHERE chat_id = %(chat_id)s
+                      AND positionCaseInsensitiveUTF8(text, %(value)s) > 0
+                    order by {DATE_COLUMN} desc limit {local_count}"""
+        params = {"chat_id": int(chat_id), "value": f"{text}"}
+
+    try:
+        result = client.execute(query, params)
+        results_dict = message_rows_to_dicts(result)
+        len_result = len(result)
+
+        if len_result >= local_count:
+            has_more = "True"
+            results_dict = results_dict[:-1]
+        else:
+            has_more = "False"
+
+        timing = float(time.time() - start_time)
+        timing = f"{timing:.5f}"
+        del client
+        results = {"has_more": has_more, "results": results_dict, "timing": timing}
+        return jsonify(results)
+    except Exception as e:
+        print(f"error: {e}, \n {query}")
+        del client
+        return jsonify({"error": str(e)}), 500
 
 # Route pour avoir plein de messages
 @app.route("/get_bulk_msgs", methods=["POST"])
@@ -1194,8 +1571,7 @@ def get_msg():
             LIMIT 1
         """
         result = client.execute(query, {"msg_id": int(msg_id), "chat_id": int(chat_id)})
-        column_names = valid_fields  # Make sure this matches the SELECT columns order
-        results_dict = [dict(zip(column_names, row)) for row in result]
+        results_dict = message_rows_to_dicts(result)
 
         return jsonify(results_dict)
 
@@ -1208,9 +1584,296 @@ def get_msg():
             client.disconnect()
 
 
+@app.route("/sync_missing_metadata", methods=["POST"])
+def sync_missing_metadata():
+    """Repair bounded Telegram channel message boundaries in Eyetroduit."""
+    from sync_last_ids import (
+        fetch_last_ids_for_ids,
+        push_last_ids,
+        resolve_message_date_column,
+    )
+
+    data = request.get_json(silent=True) or {}
+    supplied_key = request.headers.get("X-API-Key") or data.get("api_key", "")
+    if not metadata_sync_api_key or not hmac.compare_digest(
+        str(supplied_key), metadata_sync_api_key
+    ):
+        return jsonify({"error": "Invalid or missing API key"}), 403
+
+    telegram_ids = data.get("telegram_ids")
+    if (
+        not isinstance(telegram_ids, list)
+        or not telegram_ids
+        or len(telegram_ids) > 1000
+    ):
+        return jsonify({"error": "Invalid telegram_ids"}), 400
+    try:
+        telegram_ids = sorted({abs(int(value)) for value in telegram_ids})
+    except (TypeError, ValueError, OverflowError):
+        return jsonify({"error": "Invalid telegram_ids"}), 400
+    if not telegram_ids or any(value < 1 for value in telegram_ids):
+        return jsonify({"error": "Invalid telegram_ids"}), 400
+
+    config = {
+        "clickhouse_host": clickhouse_host,
+        "clickhouse_port": clickhouse_port,
+        "database_name": database_name,
+        "table_name": table_name,
+        "api_key": gn_config.get("api_key", ""),
+        "tagch": gn_config.get("tagch", ""),
+    }
+    try:
+        date_column = resolve_message_date_column(config)
+        rows = fetch_last_ids_for_ids(config, date_column, telegram_ids)
+        updated, failed = push_last_ids(config, rows)
+    except Exception as error:  # pylint: disable=broad-except
+        app.logger.exception("Metadata synchronization failed: %s", error)
+        return jsonify({"error": "Metadata synchronization failed"}), 502
+    return jsonify({"updated": updated, "failed": failed, "requested": len(telegram_ids)})
+
+
+@app.route("/get_channel/<int:channel_id>", methods=["GET"])
+def get_channel(channel_id):
+    """
+    Get Telegram channel metadata from local SQLite app.db comms table.
+
+    channel_id is matched against comms.telegram_id first.
+    If no channel matches, comms.id is used as fallback.
+    """
+    channel_id_raw = str(channel_id)
+    channel_id_abs = str(abs(channel_id))
+    include_ids = request_flag_enabled("id", "ids", "--id")
+    include_timestamps = request_flag_enabled("timestamp", "timestamps", "--timestamp")
+    limit_param = request.args.get("limit")
+
+    try:
+        message_limit = int(limit_param) if limit_param else 100
+    except ValueError:
+        return jsonify({"error": "Invalid limit"}), 400
+
+    if message_limit < 1:
+        message_limit = 1
+    if message_limit > 65000:
+        message_limit = 65000
+
+    try:
+        with sqlite3.connect(APP_DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT id, telegram_id, telegram_name, link, description
+                FROM comms
+                WHERE telegram_id IN (?, ?)
+                ORDER BY CASE WHEN telegram_id = ? THEN 0 ELSE 1 END
+                LIMIT 1
+                """,
+                (channel_id_raw, channel_id_abs, channel_id_raw),
+            ).fetchone()
+
+            if row is None:
+                row = conn.execute(
+                    """
+                    SELECT id, telegram_id, telegram_name, link, description
+                    FROM comms
+                    WHERE id = ?
+                    LIMIT 1
+                    """,
+                    (channel_id,),
+                ).fetchone()
+    except sqlite3.Error as exc:
+        logger.warning("SQLite channel lookup failed for %s: %s", channel_id, exc)
+        return jsonify({"error": "sqlite lookup failed"}), 500
+
+    if row is None:
+        return jsonify({"results": False}), 404
+
+    client = None
+    try:
+        client = Client(host=clickhouse_host, port=clickhouse_port)
+        messages_result = client.execute(
+            f"""
+            SELECT {star}
+            FROM {database_name}.{table_name}
+            WHERE abs(chat_id) = %(channel_id)s
+            ORDER BY {DATE_COLUMN} DESC
+            LIMIT %(message_limit)s
+            """,
+            {"channel_id": int(row["telegram_id"]), "message_limit": message_limit},
+        )
+    except Exception as exc:
+        logger.warning("ClickHouse message lookup failed for %s: %s", channel_id, exc)
+        return jsonify({"error": "clickhouse lookup failed"}), 500
+    finally:
+        if client:
+            client.disconnect()
+
+    if not messages_result:
+        disable_channel_for_empty_messages(row["id"])
+        return jsonify({"results": False, "error": "channel has no messages"}), 404
+
+    messages = []
+    id_fields = {"id", "chat_id", "sender_chat_id", "msg_fwd_id"}
+    timestamp_fields = {"date", "insert_date"}
+    for item in messages_result:
+        message = message_rows_to_dicts([item])[0]
+        if not include_ids:
+            for field in id_fields:
+                message.pop(field, None)
+        if not include_timestamps:
+            for field in timestamp_fields:
+                message.pop(field, None)
+        messages.append(message)
+
+    payload = {
+        "results": True,
+        "channel_name": row["telegram_name"],
+        "url": row["link"],
+        "description": row["description"],
+        "messages": messages,
+    }
+    if include_ids:
+        payload["channel_id"] = row["telegram_id"]
+
+    return jsonify(payload)
+
+
+@app.route("/getchatrandoms/<int:count>", methods=["GET"])
+def getchatrandoms(count):
+    """
+    Get random Telegram chat ids from local SQLite app.db comms table.
+
+    Only chats with last_id > 300 are eligible.
+    Channels with no messages in ClickHouse are disabled for this route by
+    setting last_id to 0, then replaced by another random channel when possible.
+    """
+    if count < 1:
+        return jsonify({"error": "Invalid count"}), 400
+    if count > 1000:
+        count = 1000
+
+    chats = []
+    disabled_count = 0
+    seen_comm_ids = set()
+    attempts = 0
+    max_attempts = 20
+
+    try:
+        with sqlite3.connect(APP_DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            client = Client(host=clickhouse_host, port=clickhouse_port)
+            try:
+                while len(chats) < count and attempts < max_attempts:
+                    attempts += 1
+                    remaining = count - len(chats)
+                    batch_size = min(max(remaining * 3, 25), 1000)
+                    rows = conn.execute(
+                        """
+                        SELECT id, telegram_id, telegram_name, link, description, last_id
+                        FROM comms
+                        WHERE telegram_id IS NOT NULL
+                          AND telegram_id != ''
+                          AND last_id > 300
+                        ORDER BY RANDOM()
+                        LIMIT ?
+                        """,
+                        (batch_size,),
+                    ).fetchall()
+                    rows = [row for row in rows if row["id"] not in seen_comm_ids]
+                    if not rows:
+                        break
+
+                    channel_ids = []
+                    rows_by_channel_id = {}
+                    invalid_comm_ids = []
+                    for row in rows:
+                        seen_comm_ids.add(row["id"])
+                        try:
+                            channel_id = abs(int(row["telegram_id"]))
+                        except (TypeError, ValueError):
+                            invalid_comm_ids.append(row["id"])
+                            continue
+                        channel_ids.append(channel_id)
+                        rows_by_channel_id[channel_id] = row
+
+                    channel_ids = list(dict.fromkeys(channel_ids))
+                    message_channel_ids = set()
+                    if channel_ids:
+                        result = client.execute(
+                            f"""
+                            SELECT abs(chat_id)
+                            FROM {database_name}.{table_name}
+                            WHERE abs(chat_id) IN %(channel_ids)s
+                            GROUP BY abs(chat_id)
+                            """,
+                            {"channel_ids": tuple(channel_ids)},
+                        )
+                        message_channel_ids = {int(row[0]) for row in result}
+
+                    disabled_comm_ids = list(invalid_comm_ids)
+                    for channel_id, row in rows_by_channel_id.items():
+                        if channel_id not in message_channel_ids:
+                            disabled_comm_ids.append(row["id"])
+                            continue
+                        chats.append(
+                            {
+                                "channel_id": row["telegram_id"],
+                                "channel_name": row["telegram_name"],
+                                "url": row["link"],
+                                "description": row["description"],
+                                "last_id": row["last_id"],
+                            }
+                        )
+                        if len(chats) >= count:
+                            break
+
+                    if disabled_comm_ids:
+                        conn.executemany(
+                            "UPDATE comms SET last_id = 0 WHERE id = ?",
+                            [(comm_id,) for comm_id in disabled_comm_ids],
+                        )
+                        conn.commit()
+                        disabled_count += len(disabled_comm_ids)
+            finally:
+                client.disconnect()
+    except sqlite3.Error as exc:
+        logger.warning("SQLite random chat lookup failed: %s", exc)
+        return jsonify({"error": "sqlite lookup failed"}), 500
+    except Exception as exc:
+        logger.warning("ClickHouse random chat validation failed: %s", exc)
+        return jsonify({"error": "clickhouse lookup failed"}), 500
+
+    return jsonify(
+        {
+            "results": True,
+            "count": len(chats),
+            "disabled_empty_channels": disabled_count,
+            "chats": chats,
+        }
+    )
+
+
 # Routes pour les stats
+def _channel_monthly_stats_query(chat_id):
+    """Build all-time published-month statistics query for one channel."""
+    return f"""
+        SELECT toStartOfMonth({DATE_COLUMN}) AS month,
+               formatDateTime(toStartOfMonth({DATE_COLUMN}), '%%Y/%%m') AS month_formatted,
+               count(*) AS count
+        FROM {database_name}.{table_name}
+        WHERE chat_id = {chat_id}
+        GROUP BY month
+        ORDER BY month DESC
+    """
+
+
 @app.route("/get_stats_chan", methods=["GET"])
 def get_stats_chan():
+    """
+    Get statistics for a single channel.
+
+    Param:
+    * chant_name
+    """
     # Connect to clickhouse
     client = Client(host=clickhouse_host, port=clickhouse_port)
 
@@ -1301,11 +1964,8 @@ def get_stats_chan():
 
     fresult["hourly"] = filled_data
 
-    # Get the count of inserted document by all months
-    query = f"SELECT toStartOfMonth({DATE_COLUMN}) as month, formatDateTime(toStartOfMonth({DATE_COLUMN}), '%%Y/%%m') as month_formatted, count(*) as count FROM \
-              {database_name}.{table_name} WHERE {DATE_COLUMN} >= subtractMonths(now(), 24) and chat_id = {chat_id} \
-              GROUP BY month ORDER BY month DESC"
-    result = client.execute(query, {})
+    # Monthly statistics cover all retained messages, using published date.
+    result = client.execute(_channel_monthly_stats_query(chat_id), {})
     fresult["monthly"] = result
 
     del client
@@ -1313,9 +1973,105 @@ def get_stats_chan():
 
 
 # Routes pour les stats
+def _stats_section(section):
+    """Return one bounded global-statistics section."""
+    client = Client(host=clickhouse_host, port=clickhouse_port)
+    result = {}
+    if section == "summary":
+        result["chats"] = client.execute(
+            f"SELECT countDistinct(chat_id) FROM {database_name}.{table_name}", {}
+        )[0]
+        result["msgs"] = client.execute(
+            f"SELECT count(msg_id) FROM {database_name}.{table_name}", {}
+        )[0]
+    elif section == "collected":
+        result["cdaily"] = client.execute(
+            f"SELECT toDate({INSERT_DATE_COLUMN}) AS actual_date, "
+            f"formatDateTime(toDate({INSERT_DATE_COLUMN}), '%%d/%%m') AS day_formatted, "
+            f"count(*) AS count FROM {database_name}.{table_name} "
+            f"WHERE {INSERT_DATE_COLUMN} >= toStartOfDay(subtractDays(now(), 31)) "
+            f"GROUP BY actual_date ORDER BY actual_date DESC",
+            {},
+        )
+        result["chourly"] = client.execute(
+            f"SELECT toStartOfHour({INSERT_DATE_COLUMN}) AS actual_hour, "
+            f"formatDateTime(toStartOfHour({INSERT_DATE_COLUMN}), '%%H:00') AS hour_formatted, "
+            f"count(*) AS count FROM {database_name}.{table_name} "
+            f"WHERE {INSERT_DATE_COLUMN} >= subtractHours(now(), 24) "
+            f"GROUP BY actual_hour ORDER BY actual_hour DESC",
+            {},
+        )
+        result["cmonthly"] = client.execute(
+            f"SELECT toStartOfMonth({INSERT_DATE_COLUMN}) AS month, "
+            f"formatDateTime(toStartOfMonth({INSERT_DATE_COLUMN}), '%%Y/%%m') AS month_formatted, "
+            f"count(*) AS count FROM {database_name}.{table_name} "
+            f"WHERE {INSERT_DATE_COLUMN} >= subtractMonths(now(), 24) "
+            f"GROUP BY month ORDER BY month DESC LIMIT 24",
+            {},
+        )
+    elif section == "published":
+        result["daily"] = client.execute(
+            f"SELECT toDate({DATE_COLUMN}) AS actual_date, "
+            f"formatDateTime(toDate({DATE_COLUMN}), '%%d/%%m') AS day_formatted, "
+            f"count(*) AS count FROM {database_name}.{table_name} "
+            f"WHERE {DATE_COLUMN} >= toStartOfDay(subtractDays(now(), 31)) "
+            f"GROUP BY actual_date ORDER BY actual_date DESC",
+            {},
+        )
+        result["hourly"] = client.execute(
+            f"SELECT toStartOfHour({DATE_COLUMN}) AS actual_hour, "
+            f"formatDateTime(toStartOfHour({DATE_COLUMN}), '%%H:00') AS hour_formatted, "
+            f"count(*) AS count FROM {database_name}.{table_name} "
+            f"WHERE {DATE_COLUMN} >= subtractHours(now(), 24) "
+            f"GROUP BY actual_hour ORDER BY actual_hour DESC",
+            {},
+        )
+        result["monthly"] = client.execute(
+            f"SELECT toStartOfMonth({DATE_COLUMN}) AS month, "
+            f"formatDateTime(toStartOfMonth({DATE_COLUMN}), '%%Y/%%m') AS month_formatted, "
+            f"count(*) AS count FROM {database_name}.{table_name} "
+            f"WHERE {DATE_COLUMN} >= subtractMonths(now(), 24) "
+            f"GROUP BY month ORDER BY month DESC LIMIT 24",
+            {},
+        )
+    elif section == "database":
+        result["top50"] = client.execute(
+            f"SELECT chat_id, chat_name, COUNT(msg_id) AS msg_count "
+            f"FROM {database_name}.{table_name} GROUP BY chat_id, chat_name "
+            f"ORDER BY msg_count DESC LIMIT 50",
+            {},
+        )
+        result["stats"] = client.execute(
+            "SELECT name, formatReadableSize(sum(data_compressed_bytes)), "
+            "formatReadableSize(sum(data_uncompressed_bytes)), "
+            "round(sum(data_uncompressed_bytes) / sum(data_compressed_bytes), 2) "
+            "FROM system.columns WHERE table = 'msg' GROUP BY name",
+            {},
+        )
+    else:
+        client.disconnect()
+        raise ValueError(f"Unknown statistics section: {section}")
+    client.disconnect()
+    return result
+
+
+@app.route("/get_stats/<section>", methods=["GET"])
+def get_stats_section(section):
+    """Return one global-statistics section without running other queries."""
+    try:
+        return jsonify(_stats_section(section.lower()))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        logger.warning("Statistics section failed: %s", exc)
+        return jsonify({"error": "statistics section unavailable"}), 502
+
+
 @app.route("/get_stats", methods=["GET"])
 def get_stats():
-
+    """
+    Retrieve all stats for TGStatsView.
+    """
     # Connect to clickhouse
     client = Client(host=clickhouse_host, port=clickhouse_port)
 
@@ -1381,6 +2137,9 @@ def get_stats():
 # Route pour avoir un message
 @app.route("/user_brief", methods=["GET"])
 def user_brief():
+    '''
+        This function give information about a User id
+    '''
 
     # Connect to clickhouse
     client = Client(host=clickhouse_host, port=clickhouse_port)
@@ -1418,13 +2177,14 @@ def user_brief():
         del client
         return jsonify({})
 
-
 @app.route("/stats_msg", methods=["GET"])
 def stats_msg():
     # Connect to clickhouse
     client = Client(host=clickhouse_host, port=clickhouse_port)
 
-    query = "select count(msg_id), chat_id ,chat_name from tme_prod.msg  where date > toDateTime('2024-09-04 00:00:00') and date < toDateTime('2024-09-04 23:59:59')  group by chat_id,chat_name order by count(msg_id) desc limit 25"
+    query = f"""select count(msg_id), chat_id ,chat_name from {database_name}.{table_name}
+               where {DATE_COLUMN} > toDateTime('2024-09-04 00:00:00') and {DATE_COLUMN} < toDateTime('2024-09-04 23:59:59')
+               group by chat_id,chat_name order by count(msg_id) desc limit 25"""
     result = client.execute(query, {})
 
     del client
@@ -1450,10 +2210,13 @@ def index():
 # Route pour les last messages
 @app.route("/count", methods=["GET"])
 def count():
+    """
+    Get the messages count in the database.
+    """
     # Connect to clickhouse
     client = Client(host=clickhouse_host, port=clickhouse_port)
 
-    query = f"select count(chat_name) from {database_name}.{table_name}"
+    query = f"select count() from {database_name}.{table_name}"
     result = client.execute(query, {})
 
     del client
@@ -1462,6 +2225,92 @@ def count():
 
 @app.route("/last", methods=["GET"])
 def last():
+    """Stream all recent messages using the legacy response contract."""
+    if request.args.get("since"):
+        since = request.args.get("since")
+    else:
+        since = int(round(time.time() * 1000))
+
+    if request.args.get("for"):
+        tfor = request.args.get("for")
+    else:
+        tfor = 5
+
+    if not valid_integer(since):
+        since = int(round(time.time() * 1000))
+    else:
+        since = int(since)
+    if not valid_integer(tfor):
+        tfor = 5
+    else:
+        tfor = int(tfor)
+    tfor = (tfor * 60) + since
+
+    page_size = 50000
+
+    def generate():
+        """Generate legacy newline-delimited message chunks."""
+        client = Client(host=clickhouse_host, port=clickhouse_port)
+        messages = 0
+        offset = 0
+
+        try:
+            while True:
+                query = f"""
+                SELECT {star}
+                FROM {database_name}.{table_name} AS t
+                WHERE t.{INSERT_DATE_COLUMN} >= toDateTime({since})
+                  AND t.{INSERT_DATE_COLUMN} <= toDateTime({tfor})
+                  AND t.{DATE_COLUMN} >= dateSub(now(), INTERVAL 2 YEAR)
+                  AND ((document_present = 1) OR (text != ''))
+                LIMIT {page_size} OFFSET {offset}
+                """
+
+                result = client.execute(query, {})
+                if not result:
+                    break
+
+                results_dict = message_rows_to_dicts(result)
+                out_dict = []
+
+                for msg in results_dict:
+                    messages += 1
+                    htext = f"On {msg.get('date')} on Telegram\n"
+                    htext += f"The following data was collected from the channel {msg.get('chat_name')}/{msg.get('chat_id')} with message id {msg.get('id')}\n"
+                    htext += f"User {msg.get('username')}/{msg.get('sender_chat_id')} wrote\n"
+                    htext += f"Subject: {msg.get('title')}\n"
+                    htext += "Content: " + msg.get("text") + "\n"
+                    if msg.get("msg_fwd") == 1:
+                        htext += f"It was a forward from the channel {msg.get('msg_fwd_username')}/{msg.get('msg_fwd_id')}\n"
+                    if msg.get("document_present") == 1:
+                        htext += f"The document {msg.get('document_name')}/{msg.get('document_type')} with a size of {msg.get('document_size')} bytes was attached to this messages.\n"
+                    htext += f"\nThis message was acquired on {msg.get('insert_date')}\n"
+                    out_dict.append(
+                        {
+                            "date": msg.get("insert_date"),
+                            "text": htext,
+                            "text_hash": hashlib.md5(
+                                msg.get("text").encode("utf-8", "ignore")
+                            ).hexdigest(),
+                            "channel_id": msg.get("chat_id"),
+                            "channel_name": msg.get("chat_name"),
+                            "msg_id": msg.get("id"),
+                        }
+                    )
+
+                yield json.dumps(
+                    {"results": out_dict, "length": len(out_dict)},
+                    default=serialize_datetime,
+                ) + "\n"
+                offset += page_size
+        finally:
+            client.disconnect()
+
+    return Response(generate(), content_type="application/json")
+
+
+@app.route("/getlast", methods=["GET"])
+def getlast():
     """
     # Route qui donne les last messages importés,
     # Filter out ce qui est "vide" (pas attachement, et pas text)
@@ -1471,91 +2320,77 @@ def last():
     #   since = timestamp du debut.
     #   for = nombre de minutes a fournir.
     #
-    #  wget "http://localhost:6000/last?since=1749342874&for=15" -O -  | jq .
+    #  wget "http://localhost:6000/getlast?since=1749342874&for=15&page=0" -O -  | jq .
     """
 
-    if request.args.get("since"):
-        since = request.args.get("since")  # Get Unix TimeStamp
-    else:
-        since = int(round(time.time() * 1000))  # Sinon c'est NOW
+    now = int(time.time())
+    default_since = now - LAST_DEFAULT_WINDOW_MINUTES * 60
+    try:
+        since = _last_integer_parameter(
+            "since", request.args.get("since"), default_since
+        )
+        window_minutes = _last_integer_parameter(
+            "for", request.args.get("for"), LAST_DEFAULT_WINDOW_MINUTES, minimum=1
+        )
+        page = _last_integer_parameter("page", request.args.get("page"), 0)
+        page_size = _last_integer_parameter(
+            "per_page",
+            request.args.get("per_page"),
+            LAST_DEFAULT_PAGE_SIZE,
+            minimum=1,
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
-    if request.args.get("for"):
-        tfor = request.args.get("for")  # minutes to fetch
-    else:
-        tfor = 5  # Si pas précisé c'est 5
+    if page_size > LAST_MAX_PAGE_SIZE:
+        return jsonify({"error": "per_page exceeds limits"}), 400
+    if page > LAST_MAX_PAGE:
+        return jsonify({"error": "page exceeds limits"}), 400
+    if since < now - LAST_MAX_WINDOW_SECONDS or since > now:
+        return jsonify({"error": "since must be within the last 31 days"}), 400
 
-    # LIMITS and default
-    if not valid_integer(since):  # Si bad integer = Now
-        since = int(round(time.time() * 1000))
-    else:
-        since = int(since)
-    if not valid_integer(tfor):
-        tfor = 5
-    else:
-        tfor = int(tfor)
-    tfor = (tfor * 60) + since  # convert to millisec
+    until = since + window_minutes * 60
+    if window_minutes * 60 > LAST_MAX_WINDOW_SECONDS:
+        return jsonify({"error": "for exceeds the 31-day limit"}), 400
+    if until > now:
+        return jsonify({"error": "since plus for cannot be in the future"}), 400
 
-    if request.args.get('per_page'):
-        page_size = request.args.get('per_page') # minutes to fetch
-    else:
-        page_size = 50000  # Taille des records par réponse (chunk)
-
-     if request.args.get('page'):
-        page = request.args.get('page') # minutes to fetch
-    else:
-        page = None
-
-    if page is not None:
-        real_offset = page_size * page
-    else:
-        real_offset = None
+    offset = page * page_size
 
     def generate():
         """
-        Generator of message with pagination for query
+        Generate one bounded page of recent messages.
         """
         client = Client(host=clickhouse_host, port=clickhouse_port)
 
-        messages = 0
-        if real_offset is not None:
-            offset = real_offset
-        else:
-            offset = 0
-
-        # on ne demande que la date spécifé dans le post
-        # on ne prends pas les message de plus de 2 ans
-        # on ne prends pas les vide
-        while True:
-            # Requête SQL avec pagination et limite qui ne choppe pas les texte vide
+        try:
             query = f"""
-            SELECT {star} 
-            FROM {database_name}.{table_name} 
-            WHERE {INSERT_DATE_COLUMN} >= toDateTime({since}) 
-              AND {INSERT_DATE_COLUMN} <= toDateTime({tfor}) 
-              AND {DATE_COLUMN} >= dateSub(now(), INTERVAL 2 YEAR) 
-              AND ((document_present = 1) OR (text != '')) 
-            LIMIT {page_size} OFFSET {offset}
+            SELECT {star}
+            FROM {database_name}.{table_name} AS t
+            WHERE t.{INSERT_DATE_COLUMN} >= toDateTime(%(since)s)
+              AND t.{INSERT_DATE_COLUMN} <= toDateTime(%(until)s)
+            AND t.{DATE_COLUMN} >= dateSub(now(), INTERVAL 2 YEAR)
+            AND ((document_present = 1) OR (text != ''))
+            ORDER BY t.{INSERT_DATE_COLUMN} ASC, t.chat_id ASC, t.msg_id ASC
+            LIMIT %(limit)s OFFSET %(offset)s
             """
 
-            # Exécuter la sql
-            result = client.execute(query, {})
-            print(f"SQL page fetched, offset: {offset}")  # Kindoff debug
+            result = client.execute(
+                query,
+                {
+                    "since": since,
+                    "until": until,
+                    "limit": page_size + 1,
+                    "offset": offset,
+                },
+            )
+            has_more = len(result) > page_size
+            result = result[:page_size]
 
-            # Si aucun résultat n'est retourné, arrêter
-            if not result:
-                break
-
-            # Préparer les résultats
-            column_names = valid_fields
-            results_dict = [dict(zip(column_names, row)) for row in result]
+            results_dict = message_rows_to_dicts(result)
             out_dict = []
 
             for msg in results_dict:
-                messages += 1
-                # Convertir les objets datetime en compatible json
-                msg["insert_date"] = msg.get("insert_date")
-                msg["date"] = msg.get("date")
-
                 htext = f"On {msg.get('date')} on Telegram\n"
                 htext += f"The following data was collected from the channel {msg.get('chat_name')}/{msg.get('chat_id')} with message id {msg.get('id')}\n"
                 htext += (
@@ -1582,54 +2417,82 @@ def last():
                     }
                 )
 
-            # Convertir en JSON et envoyer un chunk
             yield json.dumps(
-                {"results": out_dict, "length": len(out_dict)},
+                {
+                    "results": out_dict,
+                    "length": len(out_dict),
+                    "has_more": has_more,
+                    "page": page,
+                    "per_page": page_size,
+                },
                 default=serialize_datetime,
             ) + "\n"
-
-            if real_offset is not None:
-                break
-
-            # Incrémenter l'offset pour la page suivante
-            offset += page_size
-
-        print(f"Send Messages {messages}")
-        del client
+        finally:
+            client.disconnect()
 
     return Response(generate(), content_type="application/json")
 
 
 @app.route("/insert_records", methods=["POST"])
 def insert_records():
-    """
-    # Collect messages to integrate into the database.
-    """
+    """Insert one durable message batch and record its committed ranges."""
+    try:
+        payload = decode_insert_payload(request.get_json(silent=True))
+        raw_records = payload.get("records")
+        if not isinstance(raw_records, list) or not raw_records:
+            raise ValueError("No records found in the JSON data")
+        batch_id = normalize_batch_id(payload.get("batch_id"), raw_records)
+        commit_ranges = group_commit_ranges(raw_records)
+        records = [convert_record(record) for record in raw_records]
+    except (TypeError, ValueError) as error:
+        return jsonify({"error": str(error)}), 400
 
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "Invalid or missing JSON data"}), 400
-
-    records = json.loads(data).get("records")
-
-    if not records:
-        return jsonify({"error": "No records found in the JSON data"}), 400
-
-    # Conversion des champs datetime pour chaque record
-    records = [convert_record(record) for record in records]
-
-    # Connect to clickhouse
     client = Client(host=clickhouse_host, port=clickhouse_port)
-
     try:
         client.execute(f"INSERT INTO {database_name}.{table_name} VALUES", records)
-        logger.info(f"Inserted {len(records)} records into ClickHouse")
-        return jsonify({"status": "success", "inserted_records": len(records)}), 200
-    except Exception as e:
-        logger.error(f"Failed to insert records: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        logger.exception("ClickHouse insert failed for batch %s", batch_id)
+        return jsonify({"status": "error", "message": str(error)}), 500
     finally:
-        del client
+        disconnect = getattr(client, "disconnect", None)
+        if callable(disconnect):
+            disconnect()
+
+    try:
+        committed = replication_manifest.record_batch(batch_id, commit_ranges)
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.exception(
+            "Manifest commit failed after ClickHouse accepted batch %s; retry required",
+            batch_id,
+        )
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "ClickHouse accepted the batch but manifest commit failed; retry",
+                    "batch_id": batch_id,
+                }
+            ),
+            500,
+        )
+
+    logger.info(
+        "Inserted %d records in batch %s with %d committed channel ranges",
+        len(records),
+        batch_id,
+        len(committed),
+    )
+    return (
+        jsonify(
+            {
+                "status": "success",
+                "inserted_records": len(records),
+                "batch_id": batch_id,
+                "commits": committed,
+            }
+        ),
+        200,
+    )
 
 
 @app.route("/graph", methods=["GET"])
@@ -1647,7 +2510,7 @@ def get_graph():
                 sender_chat_id AS id,
                 username AS label,
                 chat_name
-            FROM tme_prod.msg
+            FROM {database_name}.{table_name}
             WHERE chat_id = {chat_id}
             AND msg_fwd_id != 0 
             AND sender_chat_id != {chat_id}
@@ -1715,7 +2578,7 @@ def get_graph():
         for user_id in nodes_map.keys():
             other_chats_query = f"""
                 SELECT DISTINCT chat_id, chat_name
-                FROM tme_prod.msg
+                FROM {database_name}.{table_name}
                 WHERE sender_chat_id = {user_id}
                 AND chat_id != {chat_id} 
             """
@@ -1753,16 +2616,18 @@ def get_graph():
 
 @app.route("/user_talk/<int:user>", methods=["GET"])
 def user_talk(user):
-    # Requête ClickHouse pour récupérer les données pour un user donné
+    '''
+        Requête ClickHouse pour récupérer les données pour un user donné
+    '''
 
     client = Client(host=clickhouse_host, port=clickhouse_port)
     query = f"""
     SELECT
-        toDate(date) AS day,
+        toDate({DATE_COLUMN}) AS day,
         chat_id,
         chat_name,
         COUNT(*) AS count
-    FROM tme_prod.msg
+    FROM {database_name}.{table_name}
     WHERE sender_chat_id = {user}
     GROUP BY day, chat_id, chat_name
     ORDER BY day
@@ -1802,15 +2667,19 @@ def user_talk(user):
 
 @app.route("/user_dailytalk/<int:user_id>")
 def user_dailytalk(user_id):
+    '''
+        Give a heatmap data for the activity of a User. GMT based.
+    '''
+
     client = Client(host=clickhouse_host, port=clickhouse_port)
     # Requête pour récupérer les données depuis ClickHouse
     query = f"""
     SELECT
-        toHour(date) AS hour,                  -- Extraire l'heure
-        toDayOfWeek(date) AS day_of_week,      -- Extraire le jour de la semaine (1 = lundi, 2 = mardi, ...)
+        toHour({DATE_COLUMN}) AS hour,                  -- Extraire l'heure
+        toDayOfWeek({DATE_COLUMN}) AS day_of_week,      -- Extraire le jour de la semaine (1 = lundi, 2 = mardi, ...)
         count(*) AS message_count              -- Compter le nombre de messages
     FROM
-        tme_prod.msg  -- Nom de la table
+        {database_name}.{table_name}  -- Nom de la table
     WHERE
         sender_chat_id = {user_id}             -- Filtrer pour l'utilisateur avec l'ID spécifique (sender_chat_id)
     GROUP BY
@@ -1851,10 +2720,10 @@ def user_dailytalk(user_id):
     for row in result:
         hour = row[0]  # Heure de la date (0-23)
         day_of_week = jours_map[row[1]]  # Jour de la semaine
-        count = row[2]  # Nombre de messages
+        local_count = row[2]  # Nombre de messages
 
         # Ajouter les messages dans le bon jour et heure
-        heatmap_data[day_of_week][hour] = count
+        heatmap_data[day_of_week][hour] = local_count
 
     del client
     # Convertir le dictionnaire en JSON
@@ -1863,24 +2732,30 @@ def user_dailytalk(user_id):
 
 @app.route("/user_details/<int:user_id>")
 def user_details(user_id):
+    '''
+        Get User details 
+            Same http location at CC level
+            Give Active since and to
+            Give On which channel the user is present
+    '''
     client = Client(host=clickhouse_host, port=clickhouse_port)
     # Requête pour récupérer les données depuis ClickHouse
     if not valid_integer(user_id):
         return jsonify({"results": False})
 
-    query = f" select date from  tme_prod.msg where sender_chat_id = {user_id} order by date asc limit 1;"
+    query = f" select {DATE_COLUMN} from {database_name}.{table_name} where sender_chat_id = {user_id} order by {DATE_COLUMN} asc limit 1;"
     data = client.execute(query)
     if not data:
         return jsonify({"results": False})
     date_in = data[0][0].strftime("%d/%m/%Y")
 
-    query = f" select date from  tme_prod.msg where sender_chat_id = {user_id} order by date desc limit 1;"
+    query = f" select {DATE_COLUMN} from {database_name}.{table_name} where sender_chat_id = {user_id} order by {DATE_COLUMN} desc limit 1;"
     data = client.execute(query)
     date_out = data[0][0].strftime("%d/%m/%Y")
 
     resume = f"Account {user_id} is active since {date_in} to {date_out}"
 
-    query = f"SELECT distinct(chat_id,chat_name, username ) FROM tme_prod.msg where sender_chat_id == {user_id}"
+    query = f"SELECT distinct(chat_id,chat_name, username ) FROM {database_name}.{table_name} where sender_chat_id == {user_id}"
 
     pseudos = []
     data = client.execute(query)

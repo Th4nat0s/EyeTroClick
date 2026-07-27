@@ -1,3 +1,6 @@
 flask
 clickhouse_driver
 pyyaml
+requests
+# Optional helper only on newer Python versions.
+# The backend now talks to LibreTranslate with urllib for Python 3.8 compatibility.
