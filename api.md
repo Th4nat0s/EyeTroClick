@@ -334,25 +334,40 @@ wget -qO- "http://127.0.0.1:6000/count" | jq .
 
 ## GET /last
 
+Legacy route. Existing clients may continue using this route and its
+newline-delimited response stream. It retains existing filtering and
+pagination behavior.
+
+## GET /getlast
+
 Stream recently inserted messages for ingestion.
 
 Parameters:
 
 ```text
-since=<unix timestamp seconds>
-for=<minutes>
+since=<unix timestamp seconds, maximum 31 days old>
+for=<minutes, maximum 44640>
+page=<zero-based page number, maximum 1000>
+per_page=<results per page, maximum 50000>
 ```
 
 Example:
 
 ```bash
-wget -qO- "http://127.0.0.1:6000/last?since=1749342874&for=15" | jq .
+wget -qO- "http://127.0.0.1:6000/getlast?since=1749342874&for=15&page=0&per_page=1000" | jq .
 ```
 
 Notes:
 
 ```text
-Only messages inserted between since and since+for are returned.
+Only messages inserted between `since` and `since+for` are returned. The
+window must end no later than the current time and must be no longer than 31
+days. Defaults are the previous five minutes, page `0`, and `per_page=50000`.
+Results are ordered by `insert_date`, `chat_id`, and `msg_id` ascending.
+Each request returns at most one page and one newline-delimited JSON object.
+The object includes `has_more`, `page`, and `per_page`; request the next page
+with `page+1` when `has_more` is true. This bounded contract prevents one
+request from streaming the whole database.
 Messages older than 2 years are skipped.
 Empty text without attachment is skipped.
 Response is newline-delimited JSON chunks.

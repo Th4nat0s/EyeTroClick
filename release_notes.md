@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add bounded `/getlast`; preserve legacy `/last` for existing clients.
+
 - Add targeted ClickHouse metadata-boundary repair for eYeTr0du1t daily maintenance.
 
 - Include all retained published message history in channel monthly statistics.

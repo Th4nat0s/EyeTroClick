@@ -142,6 +142,11 @@ METADATA_REFRESH_INTERVAL = 60
 _earliest_date = None
 FORCE_EXACT_FIELDS = {"chat_id", "username_sender_exact"}
 FORCE_INTEGER_FIELDS = {"chat_id", "username_sender_exact"}
+LAST_DEFAULT_WINDOW_MINUTES = 5
+LAST_MAX_WINDOW_SECONDS = 31 * 24 * 60 * 60
+LAST_DEFAULT_PAGE_SIZE = 50000
+LAST_MAX_PAGE_SIZE = 50000
+LAST_MAX_PAGE = 1000
 
 
 def message_rows_to_dicts(rows):
@@ -600,6 +605,19 @@ def valid_integer(value):
         return True
     except ValueError:
         return False
+
+
+def _last_integer_parameter(name, value, default, minimum=0):
+    """Parse one bounded integer query parameter for the recent-message API."""
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if parsed < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return parsed
 
 
 def request_flag_enabled(*names):
@@ -2207,6 +2225,92 @@ def count():
 
 @app.route("/last", methods=["GET"])
 def last():
+    """Stream all recent messages using the legacy response contract."""
+    if request.args.get("since"):
+        since = request.args.get("since")
+    else:
+        since = int(round(time.time() * 1000))
+
+    if request.args.get("for"):
+        tfor = request.args.get("for")
+    else:
+        tfor = 5
+
+    if not valid_integer(since):
+        since = int(round(time.time() * 1000))
+    else:
+        since = int(since)
+    if not valid_integer(tfor):
+        tfor = 5
+    else:
+        tfor = int(tfor)
+    tfor = (tfor * 60) + since
+
+    page_size = 50000
+
+    def generate():
+        """Generate legacy newline-delimited message chunks."""
+        client = Client(host=clickhouse_host, port=clickhouse_port)
+        messages = 0
+        offset = 0
+
+        try:
+            while True:
+                query = f"""
+                SELECT {star}
+                FROM {database_name}.{table_name} AS t
+                WHERE t.{INSERT_DATE_COLUMN} >= toDateTime({since})
+                  AND t.{INSERT_DATE_COLUMN} <= toDateTime({tfor})
+                  AND t.{DATE_COLUMN} >= dateSub(now(), INTERVAL 2 YEAR)
+                  AND ((document_present = 1) OR (text != ''))
+                LIMIT {page_size} OFFSET {offset}
+                """
+
+                result = client.execute(query, {})
+                if not result:
+                    break
+
+                results_dict = message_rows_to_dicts(result)
+                out_dict = []
+
+                for msg in results_dict:
+                    messages += 1
+                    htext = f"On {msg.get('date')} on Telegram\n"
+                    htext += f"The following data was collected from the channel {msg.get('chat_name')}/{msg.get('chat_id')} with message id {msg.get('id')}\n"
+                    htext += f"User {msg.get('username')}/{msg.get('sender_chat_id')} wrote\n"
+                    htext += f"Subject: {msg.get('title')}\n"
+                    htext += "Content: " + msg.get("text") + "\n"
+                    if msg.get("msg_fwd") == 1:
+                        htext += f"It was a forward from the channel {msg.get('msg_fwd_username')}/{msg.get('msg_fwd_id')}\n"
+                    if msg.get("document_present") == 1:
+                        htext += f"The document {msg.get('document_name')}/{msg.get('document_type')} with a size of {msg.get('document_size')} bytes was attached to this messages.\n"
+                    htext += f"\nThis message was acquired on {msg.get('insert_date')}\n"
+                    out_dict.append(
+                        {
+                            "date": msg.get("insert_date"),
+                            "text": htext,
+                            "text_hash": hashlib.md5(
+                                msg.get("text").encode("utf-8", "ignore")
+                            ).hexdigest(),
+                            "channel_id": msg.get("chat_id"),
+                            "channel_name": msg.get("chat_name"),
+                            "msg_id": msg.get("id"),
+                        }
+                    )
+
+                yield json.dumps(
+                    {"results": out_dict, "length": len(out_dict)},
+                    default=serialize_datetime,
+                ) + "\n"
+                offset += page_size
+        finally:
+            client.disconnect()
+
+    return Response(generate(), content_type="application/json")
+
+
+@app.route("/getlast", methods=["GET"])
+def getlast():
     """
     # Route qui donne les last messages importés,
     # Filter out ce qui est "vide" (pas attachement, et pas text)
@@ -2216,74 +2320,77 @@ def last():
     #   since = timestamp du debut.
     #   for = nombre de minutes a fournir.
     #
-    #  wget "http://localhost:6000/last?since=1749342874&for=15" -O -  | jq .
+    #  wget "http://localhost:6000/getlast?since=1749342874&for=15&page=0" -O -  | jq .
     """
 
-    if request.args.get("since"):
-        since = request.args.get("since")  # Get Unix TimeStamp
-    else:
-        since = int(round(time.time() * 1000))  # Sinon c'est NOW
+    now = int(time.time())
+    default_since = now - LAST_DEFAULT_WINDOW_MINUTES * 60
+    try:
+        since = _last_integer_parameter(
+            "since", request.args.get("since"), default_since
+        )
+        window_minutes = _last_integer_parameter(
+            "for", request.args.get("for"), LAST_DEFAULT_WINDOW_MINUTES, minimum=1
+        )
+        page = _last_integer_parameter("page", request.args.get("page"), 0)
+        page_size = _last_integer_parameter(
+            "per_page",
+            request.args.get("per_page"),
+            LAST_DEFAULT_PAGE_SIZE,
+            minimum=1,
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
-    if request.args.get("for"):
-        tfor = request.args.get("for")  # minutes to fetch
-    else:
-        tfor = 5  # Si pas précisé c'est 5
+    if page_size > LAST_MAX_PAGE_SIZE:
+        return jsonify({"error": "per_page exceeds limits"}), 400
+    if page > LAST_MAX_PAGE:
+        return jsonify({"error": "page exceeds limits"}), 400
+    if since < now - LAST_MAX_WINDOW_SECONDS or since > now:
+        return jsonify({"error": "since must be within the last 31 days"}), 400
 
-    # LIMITS and default
-    if not valid_integer(since):  # Si bad integer = Now
-        since = int(round(time.time() * 1000))
-    else:
-        since = int(since)
-    if not valid_integer(tfor):
-        tfor = 5
-    else:
-        tfor = int(tfor)
-    tfor = (tfor * 60) + since  # convert to millisec
+    until = since + window_minutes * 60
+    if window_minutes * 60 > LAST_MAX_WINDOW_SECONDS:
+        return jsonify({"error": "for exceeds the 31-day limit"}), 400
+    if until > now:
+        return jsonify({"error": "since plus for cannot be in the future"}), 400
 
-    page_size = 50000  # Taille des records par réponse (chunk)
+    offset = page * page_size
 
     def generate():
         """
-        Generator of message with pagination for query
+        Generate one bounded page of recent messages.
         """
         client = Client(host=clickhouse_host, port=clickhouse_port)
 
-        messages = 0
-        offset = 0
-
-        # on ne demande que la date spécifé dans le post
-        # on ne prends pas les message de plus de 2 ans
-        # on ne prends pas les vide
-        while True:
-            # Requête SQL avec pagination et limite qui ne choppe pas les texte vide
+        try:
             query = f"""
-            SELECT {star} 
+            SELECT {star}
             FROM {database_name}.{table_name} AS t
-            WHERE t.{INSERT_DATE_COLUMN} >= toDateTime({since}) 
-              AND t.{INSERT_DATE_COLUMN} <= toDateTime({tfor}) 
-              AND t.{DATE_COLUMN} >= dateSub(now(), INTERVAL 2 YEAR) 
-              AND ((document_present = 1) OR (text != '')) 
-            LIMIT {page_size} OFFSET {offset}
+            WHERE t.{INSERT_DATE_COLUMN} >= toDateTime(%(since)s)
+              AND t.{INSERT_DATE_COLUMN} <= toDateTime(%(until)s)
+            AND t.{DATE_COLUMN} >= dateSub(now(), INTERVAL 2 YEAR)
+            AND ((document_present = 1) OR (text != ''))
+            ORDER BY t.{INSERT_DATE_COLUMN} ASC, t.chat_id ASC, t.msg_id ASC
+            LIMIT %(limit)s OFFSET %(offset)s
             """
 
-            # Exécuter la sql
-            result = client.execute(query, {})
-            print(f"SQL page fetched, offset: {offset}")  # Kindoff debug
+            result = client.execute(
+                query,
+                {
+                    "since": since,
+                    "until": until,
+                    "limit": page_size + 1,
+                    "offset": offset,
+                },
+            )
+            has_more = len(result) > page_size
+            result = result[:page_size]
 
-            # Si aucun résultat n'est retourné, arrêter
-            if not result:
-                break
-
-            # Préparer les résultats
             results_dict = message_rows_to_dicts(result)
             out_dict = []
 
             for msg in results_dict:
-                messages += 1
-                # Convertir les objets datetime en compatible json
-                msg["insert_date"] = msg.get("insert_date")
-                msg["date"] = msg.get("date")
-
                 htext = f"On {msg.get('date')} on Telegram\n"
                 htext += f"The following data was collected from the channel {msg.get('chat_name')}/{msg.get('chat_id')} with message id {msg.get('id')}\n"
                 htext += (
@@ -2310,17 +2417,18 @@ def last():
                     }
                 )
 
-            # Convertir en JSON et envoyer un chunk
             yield json.dumps(
-                {"results": out_dict, "length": len(out_dict)},
+                {
+                    "results": out_dict,
+                    "length": len(out_dict),
+                    "has_more": has_more,
+                    "page": page,
+                    "per_page": page_size,
+                },
                 default=serialize_datetime,
             ) + "\n"
-
-            # Incrémenter l'offset pour la page suivante
-            offset += page_size
-
-        print(f"Send Messages {messages}")
-        del client
+        finally:
+            client.disconnect()
 
     return Response(generate(), content_type="application/json")
 
