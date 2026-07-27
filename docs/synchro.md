@@ -55,17 +55,28 @@ with the same `batch_id`.
 
 ## `GET /last`
 
+Legacy route retained for existing consumers. It keeps its existing streaming
+contract and is not subject to the bounded pagination contract below.
+
+## `GET /getlast`
+
 Return recently inserted messages.
 
 Parameters:
 
 ```text
-since=<unix timestamp in milliseconds>
-for=<window length in minutes>
+since=<unix timestamp in seconds, maximum 31 days old>
+for=<window length in minutes, maximum 44640>
+page=<zero-based page number, maximum 1000>
+per_page=<results per page, maximum 50000>
 ```
 
-Defaults: current time and a five-minute window. This route is useful for
-short-interval consumers that need to discover newly inserted messages.
+Defaults: previous five minutes, page `0`, and `per_page=50000`. The window
+cannot end in the future or exceed 31 days. Results use deterministic
+`insert_date`, `chat_id`, `msg_id` ascending order. Each request returns one
+bounded page and includes `has_more`, `page`, and `per_page`; request the next
+page when `has_more` is true. This route is intended for recent synchronization,
+not unrestricted database export.
 
 ## `GET /count`
 
